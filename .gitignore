@@ -1,0 +1,81 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.Python
+build/
+dist/
+.eggs/
+venv/
+.venv/
+ENV/
+env/
+.env
+.env.*
+.python-version
+
+# Packaging / tooling
+pip-wheel-metadata/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.tox/
+.nox/
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+*.ipynb_checkpoints/
+
+# IDEs and editors
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Logs and temp files
+*.log
+logs/
+tmp/
+temp/
+*.tmp
+*.bak
+*.orig
+
+# Local runtime/generated data
+output/
+artifacts/
+cache/
+checkpoints/
+models/
+mlruns/
+wandb/
+
+# Database and local state
+*.sqlite3
+*.db
+*.db-journal
+
+# Secrets and credentials
+secrets/
+*.pem
+*.key
+*.crt
+
+# Project-specific local generated content
+src/**/generated/
+src/**/.streamlit/
+
+# Allow keeping project documentation tracked
+# Do not ignore .md or .docx files in the requirement/docs folders.
