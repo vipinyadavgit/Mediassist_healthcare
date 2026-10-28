@@ -13,6 +13,7 @@ venv/
 .venv/
 ENV/
 env/
+# Environment files may contain API keys and other local secrets.
 .env
 .env.*
 .python-version

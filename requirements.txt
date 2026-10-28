@@ -1,0 +1,11 @@
+chromadb
+fastapi
+httpx
+openai
+pypdf
+python-docx
+python-dotenv
+python-multipart
+streamlit
+sentence-transformers
+uvicorn
