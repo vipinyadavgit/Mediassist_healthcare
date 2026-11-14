@@ -7,6 +7,7 @@ from datetime import datetime
 from statistics import median
 from typing import Literal, Sequence
 
+import altair as alt
 import streamlit as st
 
 from mediassist_healthcare.api_client import (
@@ -28,6 +29,11 @@ MAX_DASHBOARD_RECORDS = 200
 DOCUMENT_TYPES = ["pdf", "docx", "txt"]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
 UPLOAD_TYPES = [*DOCUMENT_TYPES, *IMAGE_TYPES]
+DASHBOARD_SOURCE_LABELS = {
+    "documents": "Documents",
+    "images": "Images",
+    "mcp": "MCP",
+}
 
 
 @dataclass(frozen=True)
@@ -99,18 +105,31 @@ def build_dashboard_metrics(
 ) -> dict[str, object]:
     """Summarize content-free workflow records for the current UI session."""
     status_counts: dict[str, int] = {}
-    source_counts = {"documents": 0, "images": 0}
+    source_counts = {"documents": 0, "images": 0, "mcp": 0}
+    task_source_counts = {
+        source: {"completed": 0, "incomplete": 0}
+        for source in ("documents", "images", "mcp")
+    }
     step_durations: dict[str, list[int]] = {}
     durations: list[int] = []
+    duration_trend: list[dict[str, object]] = []
     citations = 0
     completed_tasks = 0
     total_tasks = 0
-    for run in runs:
+    for run_number, run in enumerate(runs, start=1):
         status = str(run.get("status", "unknown"))
         status_counts[status] = status_counts.get(status, 0) + 1
         duration = run.get("duration_ms", 0)
         if isinstance(duration, int):
-            durations.append(duration)
+            safe_duration = max(0, duration)
+            durations.append(safe_duration)
+            duration_trend.append(
+                {
+                    "run": run_number,
+                    "seconds": round(safe_duration / 1000, 3),
+                    "status": status,
+                }
+            )
         citations_value = run.get("citations", [])
         if isinstance(citations_value, list):
             citations += len(citations_value)
@@ -121,11 +140,20 @@ def build_dashboard_metrics(
                         source_counts[source_type] += 1
         tasks_value = run.get("tasks", [])
         if isinstance(tasks_value, list):
-            total_tasks += len(tasks_value)
-            completed_tasks += sum(
-                isinstance(task, dict) and task.get("status") == "completed"
-                for task in tasks_value
-            )
+            for task in tasks_value:
+                if not isinstance(task, dict):
+                    continue
+                task_status = task.get("status")
+                task_source = task.get("source")
+                if (
+                    isinstance(task_status, str)
+                    and task_status in {"completed", "incomplete"}
+                    and isinstance(task_source, str)
+                    and task_source in task_source_counts
+                ):
+                    task_source_counts[task_source][task_status] += 1
+                    completed_tasks += task_status == "completed"
+                    total_tasks += 1
         traces_value = run.get("traces", [])
         if isinstance(traces_value, list):
             for trace in traces_value:
@@ -133,7 +161,11 @@ def build_dashboard_metrics(
                     continue
                 node = trace.get("node")
                 duration_ms = trace.get("duration_ms")
-                if isinstance(node, str) and isinstance(duration_ms, int):
+                if (
+                    isinstance(node, str)
+                    and isinstance(duration_ms, int)
+                    and duration_ms >= 0
+                ):
                     step_durations.setdefault(node, []).append(duration_ms)
 
     return {
@@ -143,8 +175,10 @@ def build_dashboard_metrics(
         "median_duration_ms": int(median(durations)) if durations else 0,
         "citation_count": citations,
         "source_counts": source_counts,
+        "task_source_counts": task_source_counts,
         "completed_tasks": completed_tasks,
         "total_tasks": total_tasks,
+        "duration_trend": duration_trend[-30:],
         "average_step_durations": {
             node: round(sum(values) / len(values))
             for node, values in step_durations.items()
@@ -169,7 +203,7 @@ def _dashboard_run(
         for citation in citation_items
         if isinstance(citation, dict)
         and isinstance(citation.get("source_type"), str)
-        and citation["source_type"] in {"documents", "images"}
+        and citation["source_type"] in {"documents", "images", "mcp"}
     ]
     safe_tasks = [
         {"status": task["status"], "source": task["source"]}
@@ -185,14 +219,12 @@ def _dashboard_run(
             "node": trace["node"],
             "status": trace["status"],
             "duration_ms": trace["duration_ms"],
-            "detail": trace["detail"],
         }
         for trace in trace_items
         if isinstance(trace, dict)
         and isinstance(trace.get("node"), str)
         and trace.get("status") == "completed"
         and isinstance(trace.get("duration_ms"), int)
-        and isinstance(trace.get("detail"), str)
     ]
     return {
         "timestamp": timestamp or datetime.now().astimezone().isoformat(
@@ -341,6 +373,20 @@ def _configure_page() -> None:
         .mediassist-dashboard-hero p {
             color: var(--mediassist-muted);
             margin: 0;
+        }
+        [data-testid="stMetric"] {
+            background: rgba(255, 255, 255, 0.88);
+            border: 1px solid var(--mediassist-border);
+            border-radius: 0.9rem;
+            box-shadow: 0 5px 18px rgba(27, 62, 51, 0.045);
+            padding: 0.9rem 1rem;
+        }
+        [data-testid="stMetricLabel"] {
+            color: var(--mediassist-muted);
+        }
+        [data-testid="stMetricValue"] {
+            color: var(--mediassist-ink);
+            font-weight: 700;
         }
         .mediassist-empty h3 {
             color: var(--mediassist-ink);
@@ -715,7 +761,12 @@ def _render_chat_history() -> None:
             elif exchange.status == "out_of_scope":
                 st.caption("This question is outside MediAssist's supported topics.")
             for citation in exchange.citations:
-                if citation.get("source_type") == "images":
+                if citation.get("source_type") == "mcp":
+                    st.caption(
+                        f"[{citation['reference']}] {citation['source']} · "
+                        "read-only database"
+                    )
+                elif citation.get("source_type") == "images":
                     st.caption(f"[{citation['reference']}] {citation['source']} · image")
                 else:
                     st.caption(
@@ -743,10 +794,11 @@ def _render_dashboard() -> None:
     runs: list[dict[str, object]] = st.session_state.workflow_runs
     metrics = build_dashboard_metrics(runs)
     st.markdown(
-        '<div class="mediassist-kicker">MediAssist AI · Phase 22</div>'
+        '<div class="mediassist-kicker">MediAssist AI · SESSION INSIGHTS</div>'
         '<div class="mediassist-dashboard-hero"><h2>Workflow analytics</h2>'
-        "<p>A clear view of your current session's agent activity, evidence, "
-        "and processing time. No prompts or uploaded content are stored here.</p>"
+        "<p>Understand response quality, source coverage, and processing time "
+        "for this session. Prescription text, patient identifiers, and prompts "
+        "are not shown or stored in these charts.</p>"
         "</div>",
         unsafe_allow_html=True,
     )
@@ -781,29 +833,203 @@ def _render_dashboard() -> None:
     chart_columns = st.columns(2)
     status_counts = metrics["status_counts"]
     with chart_columns[0]:
-        st.markdown("#### Workflow outcomes")
+        st.markdown("#### Response outcomes")
+        st.caption("How each workflow concluded")
         if isinstance(status_counts, dict) and status_counts:
-            st.bar_chart(status_counts, color="#167d68")
-    with chart_columns[1]:
-        st.markdown("#### Average time by agent")
-        step_durations = metrics["average_step_durations"]
-        if isinstance(step_durations, dict) and step_durations:
-            st.bar_chart(step_durations, color="#77a995")
-        else:
-            st.caption("No completed agent traces are available yet.")
-
-    source_counts = metrics["source_counts"]
-    source_columns = st.columns([1, 2])
-    with source_columns[0]:
-        st.markdown("#### Cited source types")
-        st.metric("Validated citations", int(metrics["citation_count"]))
-        if isinstance(source_counts, dict):
-            st.caption(
-                f"Documents: {source_counts.get('documents', 0)} · "
-                f"Images: {source_counts.get('images', 0)}"
+            outcome_data = [
+                {"outcome": outcome.replace("_", " ").title(), "runs": count}
+                for outcome, count in status_counts.items()
+            ]
+            outcome_chart = (
+                alt.Chart(alt.Data(values=outcome_data))
+                .mark_bar(cornerRadiusEnd=6)
+                .encode(
+                    x=alt.X("runs:Q", title="Workflows", scale=alt.Scale(domainMin=0)),
+                    y=alt.Y("outcome:N", title=None, sort="-x"),
+                    color=alt.Color(
+                        "outcome:N",
+                        title=None,
+                        scale=alt.Scale(
+                            domain=[
+                                "Answered",
+                                "Partial",
+                                "Insufficient Evidence",
+                                "Out Of Scope",
+                                "Failed",
+                            ],
+                            range=["#167d68", "#d99b3d", "#bf625a", "#748b97", "#59636b"],
+                        ),
+                        legend=None,
+                    ),
+                    tooltip=["outcome:N", "runs:Q"],
+                )
+                .properties(height=220)
+                .configure_view(stroke=None)
+                .configure_axis(
+                    gridColor="#edf2ef",
+                    domainColor="#dce8e3",
+                    labelColor="#526761",
+                    titleColor="#526761",
+                )
             )
-    with source_columns[1]:
-        st.markdown("#### Recent runs")
+            st.altair_chart(outcome_chart, width="stretch", theme=None)
+    with chart_columns[1]:
+        st.markdown("#### Response-time trend")
+        st.caption("Most recent 30 workflows · seconds")
+        duration_trend = metrics["duration_trend"]
+        if isinstance(duration_trend, list) and duration_trend:
+            duration_chart = (
+                alt.Chart(alt.Data(values=duration_trend))
+                .mark_line(
+                    color="#167d68",
+                    point=alt.OverlayMarkDef(filled=True, size=48),
+                    strokeWidth=2.5,
+                )
+                .encode(
+                    x=alt.X("run:Q", title="Workflow, oldest to newest"),
+                    y=alt.Y(
+                        "seconds:Q",
+                        title="Seconds",
+                        scale=alt.Scale(zero=True),
+                    ),
+                    tooltip=[
+                        alt.Tooltip("run:Q", title="Workflow"),
+                        alt.Tooltip("seconds:Q", title="Duration", format=".3f"),
+                        alt.Tooltip("status:N", title="Outcome"),
+                    ],
+                )
+                .properties(height=220)
+                .configure_view(stroke=None)
+                .configure_axis(
+                    gridColor="#edf2ef",
+                    domainColor="#dce8e3",
+                    labelColor="#526761",
+                    titleColor="#526761",
+                )
+            )
+            st.altair_chart(duration_chart, width="stretch", theme=None)
+        else:
+            st.caption("No response-time samples are available yet.")
+
+    st.markdown("#### Evidence and task coverage")
+    coverage_columns = st.columns(2)
+    source_counts = metrics["source_counts"]
+    with coverage_columns[0]:
+        st.caption("Validated citations by source type")
+        if isinstance(source_counts, dict) and sum(source_counts.values()) > 0:
+            source_data = [
+                {
+                    "source": DASHBOARD_SOURCE_LABELS[source],
+                    "citations": count,
+                }
+                for source, count in source_counts.items()
+                if count
+            ]
+            source_chart = (
+                alt.Chart(alt.Data(values=source_data))
+                .mark_bar(cornerRadiusEnd=6)
+                .encode(
+                    x=alt.X("citations:Q", title="Citations", scale=alt.Scale(domainMin=0)),
+                    y=alt.Y("source:N", title=None, sort="-x"),
+                    color=alt.Color(
+                        "source:N",
+                        title=None,
+                        scale=alt.Scale(
+                            domain=["Documents", "Images", "MCP"],
+                            range=["#167d68", "#6f9eae", "#d99b3d"],
+                        ),
+                        legend=None,
+                    ),
+                    tooltip=["source:N", "citations:Q"],
+                )
+                .properties(height=190)
+                .configure_view(stroke=None)
+                .configure_axis(
+                    gridColor="#edf2ef",
+                    domainColor="#dce8e3",
+                    labelColor="#526761",
+                    titleColor="#526761",
+                )
+            )
+            st.altair_chart(source_chart, width="stretch", theme=None)
+        else:
+            st.caption("No cited sources yet.")
+    with coverage_columns[1]:
+        st.caption("Planned tasks by source and completion")
+        task_source_counts = metrics["task_source_counts"]
+        task_data = [
+            {
+                "source": DASHBOARD_SOURCE_LABELS[source],
+                "status": status.title(),
+                "tasks": count,
+            }
+            for source, counts in task_source_counts.items()
+            for status, count in counts.items()
+            if count
+        ]
+        if task_data:
+            task_chart = (
+                alt.Chart(alt.Data(values=task_data))
+                .mark_bar(cornerRadius=4)
+                .encode(
+                    x=alt.X("source:N", title=None),
+                    y=alt.Y("tasks:Q", title="Tasks", stack="zero"),
+                    color=alt.Color(
+                        "status:N",
+                        title="Task status",
+                        scale=alt.Scale(
+                            domain=["Completed", "Incomplete"],
+                            range=["#167d68", "#d99b3d"],
+                        ),
+                    ),
+                    tooltip=["source:N", "status:N", "tasks:Q"],
+                )
+                .properties(height=190)
+                .configure_view(stroke=None)
+                .configure_axis(
+                    gridColor="#edf2ef",
+                    domainColor="#dce8e3",
+                    labelColor="#526761",
+                    titleColor="#526761",
+                )
+                .configure_legend(labelColor="#526761", titleColor="#526761")
+            )
+            st.altair_chart(task_chart, width="stretch", theme=None)
+        else:
+            st.caption("No planned tasks are available yet.")
+
+    st.markdown("#### Agent execution time")
+    st.caption("Average processing time per workflow step · milliseconds")
+    step_durations = metrics["average_step_durations"]
+    if isinstance(step_durations, dict) and step_durations:
+        agent_data = [
+            {"agent": agent, "milliseconds": duration}
+            for agent, duration in step_durations.items()
+        ]
+        agent_chart = (
+            alt.Chart(alt.Data(values=agent_data))
+            .mark_bar(color="#77a995", cornerRadiusEnd=6)
+            .encode(
+                x=alt.X("milliseconds:Q", title="Average milliseconds"),
+                y=alt.Y("agent:N", title=None, sort="-x"),
+                tooltip=["agent:N", "milliseconds:Q"],
+            )
+            .properties(height=min(300, max(120, 32 * len(agent_data))))
+            .configure_view(stroke=None)
+            .configure_axis(
+                gridColor="#edf2ef",
+                domainColor="#dce8e3",
+                labelColor="#526761",
+                titleColor="#526761",
+            )
+        )
+        st.altair_chart(agent_chart, width="stretch", theme=None)
+    else:
+        st.caption("No completed agent traces are available yet.")
+
+    st.markdown("#### Recent workflows")
+    with st.container(border=True):
+        st.caption("Source names and clinical content are intentionally excluded.")
         st.dataframe(
             [
                 {
@@ -812,6 +1038,19 @@ def _render_dashboard() -> None:
                     "Duration": f"{int(run.get('duration_ms', 0)) / 1000:.1f} s",
                     "Tasks": len(run.get("tasks", [])),
                     "Citations": len(run.get("citations", [])),
+                    "Evidence": ", ".join(
+                        sorted(
+                            {
+                                DASHBOARD_SOURCE_LABELS.get(
+                                    str(citation.get("source_type", "")),
+                                    "Other",
+                                )
+                                for citation in run.get("citations", [])
+                                if isinstance(citation, dict)
+                            }
+                        )
+                    )
+                    or "None",
                 }
                 for run in reversed(runs)
             ],
@@ -819,7 +1058,7 @@ def _render_dashboard() -> None:
             width="stretch",
         )
 
-    st.markdown("#### Agent execution traces")
+    st.markdown("#### Workflow traces")
     for index, run in reversed(list(enumerate(runs, start=1))):
         run_traces = run.get("traces", [])
         with st.expander(
@@ -834,8 +1073,7 @@ def _render_dashboard() -> None:
                         st.markdown(
                             f"**{trace.get('node', 'Agent')}** · "
                             f"{trace.get('status', 'unknown')} · "
-                            f"{trace.get('duration_ms', 0)} ms  \n"
-                            f"{trace.get('detail', '')}"
+                            f"{trace.get('duration_ms', 0)} ms"
                         )
 
 

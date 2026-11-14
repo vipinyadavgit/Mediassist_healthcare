@@ -35,6 +35,7 @@ from mediassist_healthcare.guardrails import (
     MAX_IMAGES_PER_QUESTION,
 )
 from mediassist_healthcare.ingestion import load_document
+from mediassist_healthcare.mcp_agent import MCPDataAgent
 from mediassist_healthcare.multimodal_agent import ImageInput, MultimodalAgent
 from mediassist_healthcare.observability import log_safe_event, safe_exception_fields
 from mediassist_healthcare.planner_agent import PlannerAgent
@@ -137,7 +138,7 @@ class CitationResponse(BaseModel):
     reference: str
     source: str
     chunk_number: int
-    source_type: Literal["documents", "images"] = "documents"
+    source_type: Literal["documents", "images", "mcp"] = "documents"
     distance: float | None = None
 
 
@@ -784,6 +785,7 @@ class BackendService:
                 retriever=RetrieverAgent(self._get_retriever()),
                 multimodal=MultimodalAgent(),
                 reasoner=ReasoningAgent(),
+                mcp_data_agent=MCPDataAgent(),
             )
         return self._agent_workflow
 

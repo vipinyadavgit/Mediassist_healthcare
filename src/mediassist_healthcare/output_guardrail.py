@@ -17,7 +17,7 @@ from mediassist_healthcare.guardrails import (
 )
 
 _BRACKETED_REFERENCE = re.compile(r"\[([^\]]+)\]")
-_VALID_REFERENCE = re.compile(r"^(?:D|I)\d+$")
+_VALID_REFERENCE = re.compile(r"^(?:D|I|M)\d+$")
 _SAFE_REFUSAL = (
     "I cannot provide this response because it did not pass the response safety "
     "checks. Please review the source information with a qualified healthcare "

@@ -63,7 +63,7 @@ class SourceEvidence:
 
     reference: str
     task_id: str
-    source_type: Literal["documents", "images"]
+    source_type: Literal["documents", "images", "mcp"]
     source: str
     text: str
     chunk_number: int
@@ -88,7 +88,7 @@ class AgentCitation:
     reference: str
     source: str
     chunk_number: int
-    source_type: Literal["documents", "images"]
+    source_type: Literal["documents", "images", "mcp"]
     distance: float | None = None
 
 

@@ -80,10 +80,18 @@ otherwise keep the backend setting disabled and do not upload sensitive images.
   those declared in the result and that each citation's source label, source
   type, and chunk number match evidence supplied to the workflow.
 - A task is marked complete only when the response reports completion and the
-  task has supporting evidence with a matching citation. Missing evidence,
-  unsupported tasks, and MCP requests are reported as incomplete.
-- MCP tasks remain incomplete because Phase 18 is not implemented. The
-  application does not connect directly to PostgreSQL.
+  task has supporting evidence with a matching citation. Missing evidence and
+  unsupported requests are reported as incomplete.
+- Phase 18 MCP access runs through a local stdio server with a small allowlist
+  of patient-record and aggregate-count tools. No tool accepts arbitrary SQL
+  or changes data. Queries use fixed, parameterized `SELECT` statements,
+  require TLS, and run in read-only transactions; MCP citations use `[M#]`.
+- Configure MCP with a dedicated database account that has only `CONNECT`,
+  schema `USAGE`, and table `SELECT` permissions on the synthetic
+  `mediassist_demo` schema. Do not configure administrator credentials.
+- Patient-specific tools accept exact `SYN-P-####` identifiers only, return
+  bounded records, and omit patient email, phone, and date of birth. These
+  controls do not replace database-level permissions or governance review.
 - A distinct output-guardrail graph node runs after reasoning. It checks
   response length, citation syntax and provenance, completion consistency,
   and a limited set of direct treatment-advice patterns. A rejected candidate
@@ -97,7 +105,7 @@ When reasoning returns incomplete tasks because their assigned document or
 image source produced no evidence, the workflow may perform **one bounded
 evidence-recovery pass**. It sends task-specific feedback to document retrieval
 or image analysis, then asks reasoning to evaluate the refreshed evidence.
-Tasks with evidence but no citation, unsupported MCP tasks, safety-rejected
+Tasks with evidence but no citation, unsupported MCP requests, safety-rejected
 answers, and planner/retrieval/provider exceptions do not trigger recovery.
 If the retry still cannot complete a task, the final partial or
 `insufficient_evidence` result is returned. The retry count is capped at one.
@@ -205,8 +213,15 @@ Before any real deployment, complete and independently review at least:
 - Phase 22 dashboard telemetry is limited to the current signed-in Streamlit
   session, capped at 200 runs, and cleared on logout/session end. It excludes
   question and response text, uploaded content, and model payloads.
-- MCP integration (Phase 18) is not implemented; such tasks are explicitly
-  incomplete.
+- Phase 18 MCP access is implemented for the synthetic dataset through a local
+  stdio server. It exposes only fixed patient-record and aggregate-count tools;
+  no tool accepts arbitrary SQL or writes data. The server uses parameterized
+  `SELECT` statements, TLS, and read-only database transactions.
+- Configure MCP with a dedicated database account that has only `CONNECT`,
+  schema `USAGE`, and table `SELECT` permissions on `mediassist_demo`. Do not
+  configure administrator credentials. Patient-specific tools require exact
+  `SYN-P-####` identifiers, bounded results, and omit email, phone, and date
+  of birth.
 - The image model is an external provider; local OCR/vision is not configured.
 - Identifier masking is best effort and raw image content is not masked.
 - The application has no production roles, comprehensive audit trail, incident
@@ -226,6 +241,12 @@ OPENAI_VISION_MODEL=gpt-4o-mini
 MEDIASSIST_ALLOW_EXTERNAL_VISION=false
 MEDIASSIST_ENABLE_LANGSMITH=false
 LANGSMITH_PROJECT=mediassist-healthcare
+MEDIASSIST_DB_HOST=your-aiven-host
+MEDIASSIST_DB_PORT=your-aiven-port
+MEDIASSIST_DB_NAME=defaultdb
+MEDIASSIST_DB_USER=mediassist_reader
+MEDIASSIST_DB_PASSWORD=your-read-only-password
+MEDIASSIST_DB_SSLMODE=require
 ```
 
 Keep credentials in the ignored local `.env` file or an approved secret

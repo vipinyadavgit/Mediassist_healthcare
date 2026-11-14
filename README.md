@@ -50,10 +50,14 @@ Phases 1–3 (requirements, architecture, and project setup) are complete. Devel
 |    14 | Multimodal agent             | Analyze selected or attached images with explicit external-processing approval | Complete |
 |    15 | Planner agent                | Classify intent and decompose requests into bounded tasks                     | Complete |
 |    16 | Retriever agent              | Retrieve account-scoped document evidence for planned tasks                   | Complete |
+|    18 | Read-only MCP integration    | Add fixed, parameterized read tools over the synthetic PostgreSQL dataset       | Complete |
 |    19 | Reasoning agent              | Synthesize cited evidence and report incomplete tasks                         | Complete |
 |    20 | Agent orchestration          | Route specialist agents through a conditional LangGraph workflow              | Complete |
 |    22 | Analytics dashboard          | Display current-session workflow metrics and content-free execution traces     | Complete |
 |    24 | Guardrails and governance    | Apply prototype input/output controls and document residual risks              | Initial implementation |
+|    26 | Unit testing                 | Test core workflow, privacy-safe analytics, and Streamlit rendering             | Initial implementation |
+|    27 | Integration testing          | Verify synthetic document upload, scoped retrieval, grounded chat, and analytics | Initial implementation |
+|    28 | Performance testing          | Record bounded local and optional read-only database p50/p95 baselines           | Initial implementation |
 
 The project tracker remains the source of truth for detailed tasks, deliverables, and status.
 
@@ -104,6 +108,15 @@ for data-flow controls and limitations.
 LangSmith tracing is optional and disabled by default. To enable metadata-only
 traces, set `MEDIASSIST_ENABLE_LANGSMITH=true` and `LANGSMITH_API_KEY` on the
 backend after reviewing the data-handling implications.
+
+For read-only access to the synthetic Aiven database, configure
+`MEDIASSIST_DB_HOST`, `MEDIASSIST_DB_PORT`, `MEDIASSIST_DB_NAME`,
+`MEDIASSIST_DB_USER`, and `MEDIASSIST_DB_PASSWORD` in the local `.env`, plus
+optional `MEDIASSIST_DB_SSLMODE` (defaults to `require`) and
+`MEDIASSIST_DB_SSLROOTCERT`. Use a dedicated account granted `SELECT` only on
+`mediassist_demo`; do not use administrator credentials. The app exposes only
+fixed MCP read tools, parameterized `SELECT` queries, and read-only database
+transactions. Never commit `.env` or use real patient information.
 
 ## Run the document loader
 
@@ -247,32 +260,41 @@ prototype has one account type and no role-based permissions.
 Chat and search are restricted to the signed-in account's documents; selected
 stored images are also checked for account ownership.
 
-## Phases 14–16, 19–20, and 22: Agent workflow and analytics
+## Phases 14–20 and 22: Agent workflow and analytics
 
 Chat requests run through a LangGraph workflow: the planner classifies
 the request and creates up to six document, image, or MCP tasks; the retriever
 searches only the authenticated account's documents; the multimodal agent
 analyzes selected stored images or new chat attachments; and the reasoning
-agent returns an answer with validated `[D1]` document or `[I1]` image
-citations and a completion status for each task. The UI can select previously
-uploaded images, attach new images to a question, or combine both (up to five
-images total). Direct attachments are processed in memory and are not saved as
-uploaded sources.
+agent returns an answer with validated `[D1]` document, `[I1]` image, or
+`[M1]` read-only MCP citations and a completion status for each task. The UI
+can select previously uploaded images, attach new images to a question, or
+combine both (up to five images total). Direct attachments are processed in
+memory and are not saved as uploaded sources.
 
 Image bytes are sent to the configured external vision provider only when
 `MEDIASSIST_ALLOW_EXTERNAL_VISION=true` is set by the backend operator **and**
 the user confirms approval in the UI. The default is disabled. This text and
 vision workflow is an educational prototype; it is not clinical decision
-support validated for patient care. Phase 18 MCP integration is not implemented,
-so MCP tasks are explicitly reported as incomplete. LangGraph orchestration
-(Phase 20) routes planner, retriever, optional multimodal, and reasoning nodes,
-with conditional paths for out-of-scope questions and image requests.
+support validated for patient care. Phase 18 MCP integration uses a local stdio
+server with only fixed patient-record and aggregate-count tools. It has no
+arbitrary SQL or write tool, uses parameterized `SELECT` queries, and starts
+each database transaction read-only. Configure it with a dedicated PostgreSQL
+user granted `SELECT` only on the synthetic `mediassist_demo` schema; never
+use Aiven administrator credentials. LangGraph orchestration (Phase 20) routes
+planner, retriever, MCP, optional multimodal, and reasoning nodes, with
+conditional paths for out-of-scope questions and image requests.
 The Analytics dashboard (Phase 22) summarizes workflows, answer status,
 durations, task completion, citation types, and agent traces. It is scoped to
 the current signed-in UI session, keeps a maximum of 200 content-free records,
 and clears them at logout/session end. It does not persist prompts, answers,
-documents, images, or model payloads. See the [backend API guide](src/mediassist_healthcare/docs/backend-api.md)
-and [guardrails and governance guide](src/mediassist_healthcare/docs/guardrails-and-governance.md).
+documents, images, or model payloads. Phases 26–28 add focused unit and API
+integration coverage plus a bounded sequential performance baseline. The
+optional Aiven measurement uses only the existing fixed read-only synthetic
+patient-count query; no live performance result is implied. See the
+[testing and performance guide](src/mediassist_healthcare/docs/testing-and-performance.md),
+[backend API guide](src/mediassist_healthcare/docs/backend-api.md), and
+[guardrails and governance guide](src/mediassist_healthcare/docs/guardrails-and-governance.md).
 
 ## Phases 24–25: Security guardrails and observability
 
@@ -348,5 +370,8 @@ README.md                    Project overview, setup, and learning roadmap
 ## Next step
 
 Continue with the next tracker-approved phase after reviewing and validating
-the current agent workflow using authorized, non-sensitive sample data. Phase
-18 (MCP integration) has not been implemented.
+the current agent workflow using authorized, non-sensitive sample data. The
+Phase 26–28 test and performance baseline implementation is described in the
+[testing and performance guide](src/mediassist_healthcare/docs/testing-and-performance.md).
+Phase 18 MCP integration is implemented for the synthetic demo dataset; patient
+access requires a dedicated read-only database account.

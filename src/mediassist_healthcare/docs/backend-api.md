@@ -121,10 +121,12 @@ in total across stored `image_source_ids` and new `image_files`. The
 
 Both chat routes validate `top_k` in the range 1–100. The response includes a
 status (`answered`, `partial`, `out_of_scope`, or `insufficient_evidence`),
-source citations (`[D1]` for documents and `[I1]` for images), planned task
-outcomes, and the retrieval mode and model. Unavailable MCP tasks are returned
-as incomplete; MCP integration is not implemented. Server filesystem paths
-and internal session metadata are not returned.
+source citations (`[D1]` for documents, `[I1]` for images, and `[M1]` for
+read-only MCP results), planned task outcomes, and the retrieval mode and model.
+MCP results are available only from fixed read-only tools over the synthetic
+`mediassist_demo` dataset. Patient-specific queries require an exact synthetic
+patient ID in `SYN-P-####` format. Server filesystem paths, database
+credentials, and internal session metadata are not returned.
 
 After reasoning, a separate output-guardrail stage checks answer length,
 citation syntax/provenance, completion consistency, and a limited set of
@@ -132,8 +134,8 @@ unsafe-treatment patterns. Rejected answers are replaced with a safe refusal.
 If a document or image task is incomplete specifically because its source
 returned no evidence, the workflow sends targeted feedback to that source
 agent and retries evidence collection and reasoning once. Safety rejections,
-provider errors, unsupported MCP tasks, and evidence-present but uncited tasks
-are not retried.
+provider errors, unsupported MCP requests, and evidence-present but uncited
+tasks are not retried.
 
 ## Storage and deletion
 
@@ -176,8 +178,8 @@ material without explicit authorization.
 
 See the [guardrails and governance guide](guardrails-and-governance.md) for
 agent behavior, input/output controls, and residual prototype risks. The
-workflow is orchestrated with LangGraph. Phase 18 MCP integration remains
-future work; MCP tasks are returned as incomplete.
+workflow is orchestrated with LangGraph. Phase 18 MCP access is limited to the
+synthetic dataset and the configured database account's permissions.
 
 ## Observability and privacy
 

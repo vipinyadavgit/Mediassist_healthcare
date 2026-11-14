@@ -31,6 +31,7 @@ from mediassist_healthcare.multimodal_agent import (
     ImageObservation,
     MultimodalAgent,
 )
+from mediassist_healthcare.mcp_agent import MCPRetrievalResult
 from mediassist_healthcare.planner_agent import PlannerAgent
 from mediassist_healthcare.reasoning_agent import ReasoningAgent
 from mediassist_healthcare.retriever_agent import RetrieverAgent
@@ -264,9 +265,9 @@ class MultimodalAgentTests(unittest.TestCase):
 
 
 class ReasoningAgentTests(unittest.TestCase):
-    """Verify task accounting, citation validation, and MCP abstention."""
+    """Verify task accounting and citation validation across evidence sources."""
 
-    def test_reasoner_cites_evidence_and_reports_unavailable_mcp_task(self) -> None:
+    def test_reasoner_completes_mcp_task_when_it_has_cited_evidence(self) -> None:
         plan = AgentPlan(
             intent="Review admission requirements and query claim status.",
             complexity="multi_step",
@@ -284,12 +285,23 @@ class ReasoningAgentTests(unittest.TestCase):
                 "admission.txt",
                 "Admission requires an intake form.",
                 1,
-            )
+            ),
+            SourceEvidence(
+                "M1",
+                "claim",
+                "mcp",
+                "Aiven synthetic billing records",
+                '{"records": [{"claim_status": "approved"}]}',
+                1,
+            ),
         ]
         client = _client_with_output(
             json.dumps(
                 {
-                    "answer": "Admission requires an intake form [D1].",
+                    "answer": (
+                        "Admission requires an intake form [D1]. "
+                        "The claim is approved [M1]."
+                    ),
                     "tasks": [
                         {
                             "task_id": "policy",
@@ -315,13 +327,57 @@ class ReasoningAgentTests(unittest.TestCase):
             "hybrid",
         )
 
-        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.status, "answered")
         reasoning_prompt = json.loads(client.responses.create.call_args.kwargs["input"])
         self.assertEqual(reasoning_prompt["response_format"], "json")
-        self.assertEqual(result.citations[0].reference, "D1")
+        self.assertEqual(
+            [citation.reference for citation in result.citations],
+            ["D1", "M1"],
+        )
         self.assertEqual(result.task_outcomes[0].status, "completed")
-        self.assertEqual(result.task_outcomes[1].status, "incomplete")
-        self.assertIn("MCP integration is not implemented", result.task_outcomes[1].reason)
+        self.assertEqual(result.task_outcomes[1].status, "completed")
+        decision = OutputGuardrail().inspect(result, evidence)
+        self.assertFalse(decision.blocked)
+
+    def test_reasoner_marks_mcp_task_incomplete_without_read_only_evidence(self) -> None:
+        plan = AgentPlan(
+            "Find a claim status.",
+            "single_step",
+            True,
+            (PlannedTask("claim", "Query the claim status.", "mcp"),),
+        )
+        client = _client_with_output(
+            json.dumps(
+                {
+                    "answer": "The claim status is unavailable.",
+                    "tasks": [
+                        {
+                            "task_id": "claim",
+                            "completed": False,
+                            "reason": "No database result was found.",
+                        }
+                    ],
+                }
+            )
+        )
+
+        result = ReasoningAgent(client=client).reason(
+            "What is the claim status?",
+            plan,
+            [],
+            [],
+            [],
+            "hybrid",
+            source_unavailable_reasons={
+                "claim": "A synthetic patient ID is required."
+            },
+        )
+
+        self.assertEqual(result.task_outcomes[0].status, "incomplete")
+        self.assertEqual(
+            result.task_outcomes[0].reason,
+            "A synthetic patient ID is required.",
+        )
 
     def test_output_guardrail_rejects_unknown_citation_references(self) -> None:
         plan = AgentPlan(
@@ -672,6 +728,84 @@ class AgentWorkflowTests(unittest.TestCase):
         )
         retriever.retrieve.assert_not_called()
         multimodal.analyze.assert_called_once()
+
+    def test_workflow_runs_read_only_mcp_after_document_retrieval(self) -> None:
+        plan = AgentPlan(
+            "Find admission policy and claim status.",
+            "multi_step",
+            True,
+            (
+                PlannedTask("policy", "Find admission policy.", "documents"),
+                PlannedTask("claim", "Find claim status.", "mcp"),
+            ),
+        )
+        document_evidence = SourceEvidence(
+            "D1",
+            "policy",
+            "documents",
+            "admission.txt",
+            "Admission requires an intake form.",
+            1,
+        )
+        database_evidence = SourceEvidence(
+            "M1",
+            "claim",
+            "mcp",
+            "Aiven synthetic billing records",
+            '{"records": [{"claim_status": "approved"}]}',
+            1,
+        )
+        planner = Mock()
+        planner.plan.return_value = plan
+        retriever = Mock()
+        retriever.retrieve.return_value = [document_evidence]
+        mcp_agent = Mock()
+        mcp_agent.retrieve.return_value = MCPRetrievalResult(
+            (database_evidence,),
+            {},
+        )
+        multimodal = Mock()
+        reasoner = Mock()
+        reasoner.reason.return_value = AgentWorkflowResult(
+            answer="Admission requires an intake form [D1]. The claim is approved [M1].",
+            status="answered",
+            citations=(
+                AgentCitation("D1", "admission.txt", 1, "documents"),
+                AgentCitation(
+                    "M1",
+                    "Aiven synthetic billing records",
+                    1,
+                    "mcp",
+                ),
+            ),
+            task_outcomes=(
+                TaskOutcome("policy", "Find admission policy.", "documents", "completed", "Cited."),
+                TaskOutcome("claim", "Find claim status.", "mcp", "completed", "Cited."),
+            ),
+            intent=plan.intent,
+            complexity=plan.complexity,
+            retrieval_mode="hybrid",
+            model="test-model",
+        )
+
+        result = AgentWorkflow(
+            planner,
+            retriever,
+            multimodal,
+            reasoner,
+            mcp_data_agent=mcp_agent,
+        ).run("Find admission policy and claim status.", "account-id")
+
+        self.assertEqual(result.status, "answered")
+        self.assertEqual(
+            [trace.node for trace in result.traces],
+            ["Planner", "Retriever", "MCP", "Reasoning", "Output guardrail"],
+        )
+        mcp_agent.retrieve.assert_called_once_with(
+            (plan.tasks[1],),
+            "Find admission policy and claim status.",
+        )
+        self.assertFalse(multimodal.analyze.called)
 
     def test_missing_document_evidence_triggers_one_focused_retry(self) -> None:
         plan = AgentPlan(

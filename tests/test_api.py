@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,7 @@ from unittest.mock import Mock
 
 from fastapi.testclient import TestClient
 
+from mediassist_healthcare.agent_Orchestration import AgentWorkflow
 from mediassist_healthcare.backend import BackendService, create_app
 from mediassist_healthcare.agent_models import (
     AgentCitation,
@@ -16,7 +18,12 @@ from mediassist_healthcare.agent_models import (
     TaskOutcome,
     WorkflowTraceEntry,
 )
-from mediassist_healthcare.retriever import RetrievedChunk
+from mediassist_healthcare.frontend import _dashboard_run, build_dashboard_metrics
+from mediassist_healthcare.multimodal_agent import MultimodalAgent
+from mediassist_healthcare.planner_agent import PlannerAgent
+from mediassist_healthcare.reasoning_agent import ReasoningAgent
+from mediassist_healthcare.retriever import RetrievedChunk, Retriever
+from mediassist_healthcare.retriever_agent import RetrieverAgent
 
 
 class FastAPIBackendTests(unittest.TestCase):
@@ -102,6 +109,7 @@ class FastAPIBackendTests(unittest.TestCase):
             retriever=self.retriever,
             agent_workflow=self.workflow,
         )
+        self.service = service
         self.app = create_app(service)
         self.client = TestClient(self.app)
         signup = self.client.post(
@@ -406,6 +414,113 @@ class FastAPIBackendTests(unittest.TestCase):
             self.workflow.run.call_args.kwargs["session_id"],
             self.session_id,
         )
+
+    def test_synthetic_prescription_upload_retrieval_chat_and_dashboard(self) -> None:
+        prescription_text = (
+            "Synthetic training prescription. "
+            "Medication name: Samplemed. "
+            "This is fictional data and is not for clinical use."
+        )
+        uploaded = self.client.post(
+            f"/api/sessions/{self.session_id}/documents",
+            files={
+                "file": (
+                    "synthetic-prescription.txt",
+                    prescription_text.encode("utf-8"),
+                    "text/plain",
+                )
+            },
+        )
+        self.assertEqual(uploaded.status_code, 201, uploaded.text)
+        upload_metadata = self.store.index_chunks.call_args.kwargs["document_metadata"]
+        upload_file_id = uploaded.json()["file_id"]
+
+        self.store.collection.query.return_value = {
+            "ids": [["synthetic-prescription-chunk-1"]],
+            "documents": [[prescription_text]],
+            "metadatas": [[
+                {
+                    "source": "synthetic-prescription.txt",
+                    "filename": "synthetic-prescription.txt",
+                    "chunk_index": 0,
+                    "session_id": self.session_id,
+                    "upload_id": upload_file_id,
+                }
+            ]],
+            "distances": [[0.08]],
+        }
+        planner_client = Mock()
+        planner_client.responses.create.return_value.output_text = json.dumps(
+            {
+                "in_scope": True,
+                "intent": "Find the medication name in a synthetic document.",
+                "complexity": "single_step",
+                "tasks": [
+                    {
+                        "task_id": "prescription_lookup",
+                        "description": "Identify the medication name shown.",
+                        "source": "documents",
+                    }
+                ],
+            }
+        )
+        reasoning_client = Mock()
+        reasoning_client.responses.create.return_value.output_text = json.dumps(
+            {
+                "answer": "The synthetic prescription lists Samplemed [D1].",
+                "tasks": [
+                    {
+                        "task_id": "prescription_lookup",
+                        "completed": True,
+                        "reason": "The uploaded synthetic document names Samplemed.",
+                    }
+                ],
+            }
+        )
+        self.service._agent_workflow = AgentWorkflow(
+            planner=PlannerAgent(client=planner_client, model_name="test-model"),
+            retriever=RetrieverAgent(
+                Retriever(self.store, embedder=self.embedder)
+            ),
+            multimodal=MultimodalAgent(),
+            reasoner=ReasoningAgent(
+                client=reasoning_client,
+                model_name="test-model",
+            ),
+        )
+
+        chat = self.client.post(
+            f"/api/sessions/{self.session_id}/chat",
+            json={
+                "question": "What medication name is shown in this synthetic prescription?",
+                "mode": "semantic",
+            },
+        )
+
+        self.assertEqual(chat.status_code, 200, chat.text)
+        self.assertEqual(chat.json()["status"], "answered")
+        self.assertEqual(chat.json()["answer"], "The synthetic prescription lists Samplemed [D1].")
+        self.assertEqual(chat.json()["citations"][0]["reference"], "D1")
+        self.assertEqual(
+            chat.json()["citations"][0]["source"],
+            "synthetic-prescription.txt",
+        )
+        self.assertEqual(chat.json()["tasks"][0]["status"], "completed")
+        self.assertEqual(upload_metadata["filename"], "synthetic-prescription.txt")
+        self.assertEqual(upload_metadata["session_id"], self.session_id)
+        self.store.collection.query.assert_called_once()
+        self.assertEqual(
+            self.store.collection.query.call_args.kwargs["where"],
+            {"session_id": self.session_id},
+        )
+
+        dashboard_record = _dashboard_run(chat.json(), 125)
+        dashboard_metrics = build_dashboard_metrics([dashboard_record])
+        self.assertEqual(dashboard_metrics["answered_runs"], 1)
+        self.assertEqual(dashboard_metrics["source_counts"]["documents"], 1)
+        self.assertEqual(dashboard_metrics["completed_tasks"], 1)
+        self.assertNotIn("Samplemed", str(dashboard_record))
+        self.assertNotIn("synthetic-prescription.txt", str(dashboard_record))
 
     def test_chat_route_accepts_a_direct_image_attachment(self) -> None:
         image_bytes = b"\x89PNG\r\n\x1a\nvalid image payload"

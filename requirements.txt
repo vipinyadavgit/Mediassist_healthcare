@@ -1,8 +1,11 @@
 chromadb
+altair>=5.0.0
 fastapi
 httpx
+mcp>=2,<3
 openai
 pypdf
+psycopg[binary]>=3.2
 python-docx
 python-dotenv
 python-multipart

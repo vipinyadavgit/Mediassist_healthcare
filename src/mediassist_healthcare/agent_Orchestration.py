@@ -24,6 +24,7 @@ from mediassist_healthcare.guardrails import (
     validate_history,
     validate_question,
 )
+from mediassist_healthcare.mcp_agent import MCPDataAgent, MCPRetrievalResult
 from mediassist_healthcare.multimodal_agent import (
     ExternalVisionDisabledError,
     ImageInput,
@@ -56,6 +57,7 @@ class AgentWorkflowState(TypedDict, total=False):
     result: AgentWorkflowResult
     retry_count: int
     retry_feedback: list[EvidenceGap]
+    mcp_unavailable_reasons: dict[str, str]
     guardrail_blocked: bool
     traces: list[WorkflowTraceEntry]
     observation: WorkflowObservation
@@ -72,6 +74,7 @@ class AgentWorkflow:
         reasoner: ReasoningAgent,
         observer: WorkflowObserver | None = None,
         output_guardrail: OutputGuardrail | None = None,
+        mcp_data_agent: MCPDataAgent | None = None,
     ) -> None:
         self.planner = planner
         self.retriever = retriever
@@ -79,9 +82,11 @@ class AgentWorkflow:
         self.reasoner = reasoner
         self.observer = observer or WorkflowObserver()
         self.output_guardrail = output_guardrail or OutputGuardrail()
+        self.mcp_data_agent = mcp_data_agent
         graph = StateGraph(AgentWorkflowState)
         graph.add_node("plan", self._plan_node)
         graph.add_node("retrieve", self._retrieve_node)
+        graph.add_node("query_mcp", self._query_mcp_node)
         graph.add_node("analyze_images", self._analyze_images_node)
         graph.add_node("reason", self._reason_node)
         graph.add_node("output_guardrail", self._output_guardrail_node)
@@ -92,6 +97,7 @@ class AgentWorkflow:
             self._route_after_planning,
             {
                 "retrieve": "retrieve",
+                "query_mcp": "query_mcp",
                 "analyze_images": "analyze_images",
                 "reason": "reason",
             },
@@ -99,6 +105,15 @@ class AgentWorkflow:
         graph.add_conditional_edges(
             "retrieve",
             self._route_after_retrieval,
+            {
+                "query_mcp": "query_mcp",
+                "analyze_images": "analyze_images",
+                "reason": "reason",
+            },
+        )
+        graph.add_conditional_edges(
+            "query_mcp",
+            self._route_after_mcp,
             {"analyze_images": "analyze_images", "reason": "reason"},
         )
         graph.add_edge("analyze_images", "reason")
@@ -222,7 +237,10 @@ class AgentWorkflow:
         else:
             feedback_by_task = {}
             target_task_ids = set()
-            tasks = state["plan"].tasks
+            tasks = tuple(
+                task for task in state["plan"].tasks
+                if task.source == "documents"
+            )
         try:
             evidence = self.retriever.retrieve(
                 tasks,
@@ -267,6 +285,37 @@ class AgentWorkflow:
             ),
         }
 
+    def _query_mcp_node(self, state: AgentWorkflowState) -> dict[str, object]:
+        started = perf_counter()
+        tasks = tuple(
+            task for task in state["plan"].tasks if task.source == "mcp"
+        )
+        try:
+            if self.mcp_data_agent is None:
+                result = MCPRetrievalResult(
+                    (),
+                    {
+                        task.task_id: "No read-only MCP data provider is configured."
+                        for task in tasks
+                    },
+                )
+            else:
+                result = self.mcp_data_agent.retrieve(tasks, state["question"])
+        except Exception as error:
+            self._record_node_failure(state, "MCP", started, error)
+            raise
+        return {
+            "evidence": [*state.get("evidence", []), *result.evidence],
+            "mcp_unavailable_reasons": result.unavailable_reasons,
+            "traces": self._append_trace(
+                state,
+                "MCP",
+                started,
+                f"Retrieved {len(result.evidence)} structured-data evidence item(s).",
+                {"evidence_count": len(result.evidence)},
+            ),
+        }
+
     def _analyze_images_node(self, state: AgentWorkflowState) -> dict[str, object]:
         started = perf_counter()
         feedback = [
@@ -305,6 +354,9 @@ class AgentWorkflow:
                 images=state.get("observations", []),
                 history=state.get("history", []),
                 mode=state.get("mode", "hybrid"),
+                source_unavailable_reasons=state.get(
+                    "mcp_unavailable_reasons", {}
+                ),
             )
         except Exception as error:
             self._record_node_failure(state, "Reasoning", started, error)
@@ -380,7 +432,7 @@ class AgentWorkflow:
 
     @staticmethod
     def _available_evidence(state: AgentWorkflowState) -> list[SourceEvidence]:
-        """Return document and image evidence references available to the answer."""
+        """Return document, image, and MCP evidence available to the answer."""
         evidence = list(state.get("evidence", []))
         plan = state.get("plan")
         if plan is None:
@@ -460,6 +512,8 @@ class AgentWorkflow:
             return "reason"
         if any(task.source == "documents" for task in plan.tasks):
             return "retrieve"
+        if any(task.source == "mcp" for task in plan.tasks):
+            return "query_mcp"
         if (
             state.get("images")
             and any(task.source == "images" for task in plan.tasks)
@@ -474,12 +528,25 @@ class AgentWorkflow:
             if any(item.source == "images" for item in retry_feedback):
                 return "analyze_images"
             return "reason"
+        if any(task.source == "mcp" for task in state["plan"].tasks):
+            return "query_mcp"
         has_image_task = any(
             task.source == "images" for task in state["plan"].tasks
         )
         if has_image_task and state.get("images"):
             return "analyze_images"
         return "reason"
+
+    @staticmethod
+    def _route_after_mcp(state: AgentWorkflowState) -> str:
+        has_image_task = any(
+            task.source == "images" for task in state["plan"].tasks
+        )
+        return (
+            "analyze_images"
+            if has_image_task and state.get("images")
+            else "reason"
+        )
 
     @staticmethod
     def _route_after_output_guardrail(state: AgentWorkflowState) -> str:

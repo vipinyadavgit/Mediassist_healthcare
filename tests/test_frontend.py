@@ -54,7 +54,10 @@ class StreamlitFrontendStateTests(unittest.TestCase):
             "answer": "Private response text",
             "question": "Private question text",
             "status": "partial",
-            "citations": [{"source_type": "documents"}],
+            "citations": [
+                {"source_type": "documents"},
+                {"source_type": "mcp"},
+            ],
             "tasks": [
                 {
                     "task_id": "policy",
@@ -94,16 +97,53 @@ class StreamlitFrontendStateTests(unittest.TestCase):
         self.assertNotIn("answer", record)
         self.assertNotIn("Sensitive planned description", str(record))
         self.assertNotIn("Sensitive model-generated reason", str(record))
+        self.assertNotIn("Created 2 tasks.", str(record))
         self.assertEqual(metrics["total_runs"], 1)
         self.assertEqual(metrics["status_counts"], {"partial": 1})
         self.assertEqual(metrics["median_duration_ms"], 40)
-        self.assertEqual(metrics["citation_count"], 1)
+        self.assertEqual(metrics["citation_count"], 2)
+        self.assertEqual(
+            metrics["source_counts"],
+            {"documents": 1, "images": 0, "mcp": 1},
+        )
         self.assertEqual(metrics["completed_tasks"], 1)
         self.assertEqual(metrics["total_tasks"], 2)
+        self.assertEqual(metrics["task_source_counts"]["documents"], {
+            "completed": 1,
+            "incomplete": 0,
+        })
+        self.assertEqual(metrics["task_source_counts"]["mcp"], {
+            "completed": 0,
+            "incomplete": 1,
+        })
+        self.assertEqual(metrics["duration_trend"], [
+            {"run": 1, "seconds": 0.04, "status": "partial"},
+        ])
         self.assertEqual(
             metrics["average_step_durations"],
             {"Planner": 8, "Retriever": 20},
         )
+
+    def test_dashboard_metrics_bound_trends_and_ignore_invalid_task_sources(self) -> None:
+        runs = [
+            {
+                "status": "answered",
+                "duration_ms": index * 1000,
+                "tasks": [
+                    {"status": "completed", "source": ["untrusted"]},
+                    {"status": "completed", "source": "documents"},
+                ],
+            }
+            for index in range(35)
+        ]
+
+        metrics = build_dashboard_metrics(runs)
+
+        self.assertEqual(metrics["total_tasks"], 35)
+        self.assertEqual(metrics["completed_tasks"], 35)
+        self.assertEqual(len(metrics["duration_trend"]), 30)
+        self.assertEqual(metrics["duration_trend"][0]["run"], 6)
+        self.assertEqual(metrics["duration_trend"][-1]["run"], 35)
 
     def test_dashboard_page_renders_for_an_authenticated_session(self) -> None:
         from streamlit.testing.v1 import AppTest
@@ -148,7 +188,10 @@ class StreamlitFrontendStateTests(unittest.TestCase):
         self.assertFalse(app.exception)
         markdown_values = [element.value for element in app.markdown]
         self.assertTrue(any("Workflow analytics" in value for value in markdown_values))
-        self.assertTrue(any("Agent execution traces" in value for value in markdown_values))
+        self.assertTrue(any("Response outcomes" in value for value in markdown_values))
+        self.assertTrue(any("Response-time trend" in value for value in markdown_values))
+        self.assertTrue(any("Evidence and task coverage" in value for value in markdown_values))
+        self.assertTrue(any("Workflow traces" in value for value in markdown_values))
 
     def test_add_source_file_appends_name_and_size(self) -> None:
         existing = [SourceFile("existing", "policy.pdf", 1024, "document")]
