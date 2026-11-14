@@ -1,25 +1,33 @@
-"""Render the MediAssist Streamlit frontend and connect it to the Phase 12 API."""
+"""Render the MediAssist Streamlit frontend and connect it to the FastAPI backend."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Sequence
-from uuid import uuid4
+from datetime import datetime
+from statistics import median
+from typing import Literal, Sequence
 
 import streamlit as st
 
 from mediassist_healthcare.api_client import (
     APIClientError,
+    auth_error_message,
     ask_backend,
     delete_source as delete_backend_source,
     list_sources,
+    login_user,
+    logout_user,
+    signup_user,
     upload_source,
 )
+from mediassist_healthcare.auth import validate_password
 from mediassist_healthcare.settings import get_api_base_url
 
 MAX_VISIBLE_EXCHANGES = 5
+MAX_DASHBOARD_RECORDS = 200
 DOCUMENT_TYPES = ["pdf", "docx", "txt"]
 IMAGE_TYPES = ["png", "jpg", "jpeg", "webp"]
+UPLOAD_TYPES = [*DOCUMENT_TYPES, *IMAGE_TYPES]
 
 
 @dataclass(frozen=True)
@@ -30,6 +38,8 @@ class ChatExchange:
     answer: str
     citations: list[dict[str, object]] = field(default_factory=list)
     status: str = "answered"
+    tasks: list[dict[str, str]] = field(default_factory=list)
+    traces: list[dict[str, object]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -63,12 +73,137 @@ def remove_source_file(
     return [source for source in sources if source.file_id != file_id]
 
 
+# Determine the backend upload route from a supported file's extension.
+def source_kind_for_filename(filename: str) -> Literal["document", "image"]:
+    """Return whether a supported upload is a document or image."""
+    suffix = filename.rsplit(".", maxsplit=1)[-1].casefold()
+    if "." not in filename:
+        raise ValueError("The uploaded file must have a supported extension.")
+    if suffix in DOCUMENT_TYPES:
+        return "document"
+    if suffix in IMAGE_TYPES:
+        return "image"
+    raise ValueError("Choose a supported document or image file.")
+
+
 # Keep complete question/answer pairs and discard the oldest pair first.
 def keep_recent_exchanges(
     exchanges: Sequence[ChatExchange],
 ) -> list[ChatExchange]:
     """Return at most the latest five exchanges in FIFO order."""
     return list(exchanges[-MAX_VISIBLE_EXCHANGES:])
+
+
+def build_dashboard_metrics(
+    runs: Sequence[dict[str, object]],
+) -> dict[str, object]:
+    """Summarize content-free workflow records for the current UI session."""
+    status_counts: dict[str, int] = {}
+    source_counts = {"documents": 0, "images": 0}
+    step_durations: dict[str, list[int]] = {}
+    durations: list[int] = []
+    citations = 0
+    completed_tasks = 0
+    total_tasks = 0
+    for run in runs:
+        status = str(run.get("status", "unknown"))
+        status_counts[status] = status_counts.get(status, 0) + 1
+        duration = run.get("duration_ms", 0)
+        if isinstance(duration, int):
+            durations.append(duration)
+        citations_value = run.get("citations", [])
+        if isinstance(citations_value, list):
+            citations += len(citations_value)
+            for citation in citations_value:
+                if isinstance(citation, dict):
+                    source_type = citation.get("source_type")
+                    if isinstance(source_type, str) and source_type in source_counts:
+                        source_counts[source_type] += 1
+        tasks_value = run.get("tasks", [])
+        if isinstance(tasks_value, list):
+            total_tasks += len(tasks_value)
+            completed_tasks += sum(
+                isinstance(task, dict) and task.get("status") == "completed"
+                for task in tasks_value
+            )
+        traces_value = run.get("traces", [])
+        if isinstance(traces_value, list):
+            for trace in traces_value:
+                if not isinstance(trace, dict):
+                    continue
+                node = trace.get("node")
+                duration_ms = trace.get("duration_ms")
+                if isinstance(node, str) and isinstance(duration_ms, int):
+                    step_durations.setdefault(node, []).append(duration_ms)
+
+    return {
+        "total_runs": len(runs),
+        "answered_runs": status_counts.get("answered", 0),
+        "status_counts": status_counts,
+        "median_duration_ms": int(median(durations)) if durations else 0,
+        "citation_count": citations,
+        "source_counts": source_counts,
+        "completed_tasks": completed_tasks,
+        "total_tasks": total_tasks,
+        "average_step_durations": {
+            node: round(sum(values) / len(values))
+            for node, values in step_durations.items()
+        },
+    }
+
+
+def _dashboard_run(
+    response: dict[str, object],
+    duration_ms: int,
+    timestamp: str | None = None,
+) -> dict[str, object]:
+    """Keep only dashboard-safe status, counts, and content-free node traces."""
+    citations = response.get("citations", [])
+    tasks = response.get("tasks", [])
+    traces = response.get("traces", [])
+    citation_items = citations if isinstance(citations, list) else []
+    task_items = tasks if isinstance(tasks, list) else []
+    trace_items = traces if isinstance(traces, list) else []
+    safe_citations = [
+        {"source_type": citation["source_type"]}
+        for citation in citation_items
+        if isinstance(citation, dict)
+        and isinstance(citation.get("source_type"), str)
+        and citation["source_type"] in {"documents", "images"}
+    ]
+    safe_tasks = [
+        {"status": task["status"], "source": task["source"]}
+        for task in task_items
+        if isinstance(task, dict)
+        and isinstance(task.get("status"), str)
+        and task["status"] in {"completed", "incomplete"}
+        and isinstance(task.get("source"), str)
+        and task["source"] in {"documents", "images", "mcp"}
+    ]
+    safe_traces = [
+        {
+            "node": trace["node"],
+            "status": trace["status"],
+            "duration_ms": trace["duration_ms"],
+            "detail": trace["detail"],
+        }
+        for trace in trace_items
+        if isinstance(trace, dict)
+        and isinstance(trace.get("node"), str)
+        and trace.get("status") == "completed"
+        and isinstance(trace.get("duration_ms"), int)
+        and isinstance(trace.get("detail"), str)
+    ]
+    return {
+        "timestamp": timestamp or datetime.now().astimezone().isoformat(
+            timespec="seconds"
+        ),
+        "status": response.get("status", "unknown"),
+        "duration_ms": max(0, duration_ms),
+        "citations": safe_citations,
+        "tasks": safe_tasks,
+        "traces": safe_traces,
+    }
 
 
 # Configure the page and keep colors readable in the light healthcare palette.
@@ -190,6 +325,23 @@ def _configure_page() -> None:
             margin: 2rem 0 1.25rem;
             padding: 1.6rem 1.75rem;
         }
+        .mediassist-dashboard-hero {
+            background: linear-gradient(120deg, #ffffff 0%, #eaf5f0 100%);
+            border: 1px solid var(--mediassist-border);
+            border-radius: 1.1rem;
+            margin: 0.6rem 0 1.2rem;
+            padding: 1.35rem 1.55rem;
+        }
+        .mediassist-dashboard-hero h2 {
+            color: var(--mediassist-ink);
+            font-size: 1.35rem;
+            letter-spacing: -0.025em;
+            margin: 0 0 0.35rem;
+        }
+        .mediassist-dashboard-hero p {
+            color: var(--mediassist-muted);
+            margin: 0;
+        }
         .mediassist-empty h3 {
             color: var(--mediassist-ink);
             font-size: 1.05rem;
@@ -227,20 +379,22 @@ def _configure_page() -> None:
     )
 
 
-# Initialize session-only lists and counters used by the frontend.
+# Initialize the source list and counters used by the frontend.
 def _initialize_session() -> None:
+    if "access_token" not in st.session_state:
+        st.session_state.access_token = ""
+    if "authenticated_user" not in st.session_state:
+        st.session_state.authenticated_user = None
     if "backend_session_id" not in st.session_state:
-        st.session_state.backend_session_id = str(uuid4())
-    if "document_sources" not in st.session_state:
-        st.session_state.document_sources = []
-    if "image_sources" not in st.session_state:
-        st.session_state.image_sources = []
+        st.session_state.backend_session_id = ""
+    if "sources" not in st.session_state:
+        st.session_state.sources = []
     if "chat_exchanges" not in st.session_state:
         st.session_state.chat_exchanges = []
-    if "document_upload_slot" not in st.session_state:
-        st.session_state.document_upload_slot = 0
-    if "image_upload_slot" not in st.session_state:
-        st.session_state.image_upload_slot = 0
+    if "workflow_runs" not in st.session_state:
+        st.session_state.workflow_runs = []
+    if "upload_slot" not in st.session_state:
+        st.session_state.upload_slot = 0
 
 
 # Refresh backend-persisted file names for the current browser session.
@@ -249,84 +403,70 @@ def _refresh_sources() -> None:
         sources = list_sources(
             get_api_base_url(),
             st.session_state.backend_session_id,
+            st.session_state.access_token,
         )
     except APIClientError as error:
         st.session_state.backend_error = str(error)
         return
 
-    st.session_state.document_sources = [
+    st.session_state.sources = [
         add_source_file(
             [],
             item["file_id"],
             item["name"],
             item["size_bytes"],
-            "document",
+            item["kind"],
         )[0]
         for item in sources
-        if item["kind"] == "document"
-    ]
-    st.session_state.image_sources = [
-        add_source_file(
-            [],
-            item["file_id"],
-            item["name"],
-            item["size_bytes"],
-            "image",
-        )[0]
-        for item in sources
-        if item["kind"] == "image"
     ]
     st.session_state.backend_error = ""
 
 
-# Add one file to the backend or remove its backend source and indexed chunks.
-def _render_upload_section(
-    title: str,
-    section_key: str,
-    accepted_types: list[str],
-    source_state_key: str,
-    slot_state_key: str,
-    kind: str,
-) -> None:
-    st.markdown(f"### {title}")
+# Upload one document or image and display all session sources in one list.
+def _render_sources() -> None:
+    st.markdown("#### Upload documents or images")
+    st.caption("Add one file at a time. Remove any source whenever you like.")
     selected_file = st.file_uploader(
-        f"Select one {title.lower()[:-1]} file",
-        type=accepted_types,
+        "Select one document or image",
+        type=UPLOAD_TYPES,
         accept_multiple_files=False,
-        key=f"{section_key}_uploader_{st.session_state[slot_state_key]}",
+        key=f"source_uploader_{st.session_state.upload_slot}",
         label_visibility="collapsed",
     )
 
     if st.button(
-        f"Add {title[:-1].lower()}",
-        key=f"{section_key}_add",
+        "Add to sources",
+        key="source_add",
         use_container_width=True,
         type="primary",
     ):
         if selected_file is None:
-            st.warning(f"Choose a {title[:-1].lower()} before adding it.")
+            st.warning("Choose a document or image before adding it.")
         else:
             try:
+                kind = source_kind_for_filename(selected_file.name)
                 uploaded = upload_source(
                     get_api_base_url(),
                     st.session_state.backend_session_id,
+                    st.session_state.access_token,
                     kind,
                     selected_file.name,
                     selected_file.getvalue(),
                     selected_file.type or "application/octet-stream",
                 )
+            except ValueError as error:
+                st.error(str(error))
             except APIClientError as error:
                 st.error(str(error))
             else:
-                current_sources = st.session_state[source_state_key]
-                st.session_state[source_state_key] = add_source_file(
-                    current_sources,
+                st.session_state.sources = add_source_file(
+                    st.session_state.sources,
                     uploaded["file_id"],
                     uploaded["name"],
                     uploaded["size_bytes"],
                     uploaded["kind"],
                 )
-                st.session_state[slot_state_key] += 1
+                st.session_state.upload_slot += 1
                 st.toast(uploaded["message"], icon="✅")
                 st.rerun()
 
@@ -334,7 +474,7 @@ def _render_upload_section(
         '<div class="mediassist-source-label">Sources</div>',
         unsafe_allow_html=True,
     )
-    sources: list[SourceFile] = st.session_state[source_state_key]
+    sources: list[SourceFile] = st.session_state.sources
     if not sources:
         st.caption("Your added files will appear here.")
         return
@@ -342,24 +482,26 @@ def _render_upload_section(
     for source in sources:
         name_column, remove_column = st.columns([4, 1], vertical_alignment="center")
         with name_column:
-            st.text(source.name)
+            source_type = "Image" if source.kind == "image" else "Document"
+            st.text(f"{source_type}: {source.name}")
             st.caption(f"{source.size_bytes / 1024:.0f} KB")
         with remove_column:
             if st.button(
                 "✕",
-                key=f"{section_key}_remove_{source.file_id}",
+                key=f"source_remove_{source.file_id}",
                 help=f"Remove {source.name} from sources",
             ):
                 try:
                     delete_backend_source(
                         get_api_base_url(),
                         st.session_state.backend_session_id,
+                        st.session_state.access_token,
                         source.file_id,
                     )
                 except APIClientError as error:
                     st.error(str(error))
                 else:
-                    st.session_state[source_state_key] = remove_source_file(
+                    st.session_state.sources = remove_source_file(
                         sources,
                         source.file_id,
                     )
@@ -374,35 +516,176 @@ def _render_sidebar() -> None:
             '<p class="mediassist-subtitle">Healthcare knowledge assistant</p>',
             unsafe_allow_html=True,
         )
+        user = st.session_state.authenticated_user
+        st.caption(f"Signed in as **{user['first_name']} {user['last_name']}**")
+        if st.button("Log out", key="logout", use_container_width=True):
+            try:
+                logout_user(
+                    get_api_base_url(),
+                    st.session_state.access_token,
+                )
+            except APIClientError as error:
+                st.session_state.auth_message = (
+                    f"Signed out locally. The server session could not be revoked: {error}"
+                )
+            else:
+                st.session_state.auth_message = "You have been signed out."
+            st.session_state.access_token = ""
+            st.session_state.authenticated_user = None
+            st.session_state.backend_session_id = ""
+            st.session_state.sources = []
+            st.session_state.chat_exchanges = []
+            st.session_state.workflow_runs = []
+            st.rerun()
         st.markdown("#### Knowledge sources")
-        st.caption("Add one file at a time. Remove any source whenever you like.")
-        _render_upload_section(
-            "Documents",
-            "document",
-            DOCUMENT_TYPES,
-            "document_sources",
-            "document_upload_slot",
-            "document",
-        )
-        st.divider()
-        _render_upload_section(
-            "Images",
-            "image",
-            IMAGE_TYPES,
-            "image_sources",
-            "image_upload_slot",
-            "image",
-        )
+        _render_sources()
         st.divider()
         if st.session_state.backend_error:
             st.error(st.session_state.backend_error)
         else:
             st.markdown(
                 '<div class="mediassist-note"><strong>API connected</strong><br>'
-                "Documents are indexed for this session. Images are stored only; "
-                "OCR and vision analysis are not enabled.</div>",
+                "Documents are indexed for this session. Image analysis requires "
+                "backend enablement and your per-request approval.</div>",
                 unsafe_allow_html=True,
             )
+
+
+# Save the authenticated identity and use its stable ID for source ownership.
+def _start_authenticated_session(auth: dict[str, object]) -> None:
+    user = auth["user"]
+    if not isinstance(user, dict):
+        raise APIClientError("The backend returned an invalid user profile.")
+    access_token = auth.get("access_token")
+    if not isinstance(access_token, str) or not access_token:
+        raise APIClientError("The backend did not return a valid login session.")
+    user_id = user.get("user_id")
+    if not isinstance(user_id, str) or not user_id:
+        raise APIClientError("The backend profile does not include an account ID.")
+    st.session_state.access_token = access_token
+    st.session_state.authenticated_user = user
+    st.session_state.backend_session_id = user_id
+    st.session_state.sources = []
+    st.session_state.chat_exchanges = []
+    st.session_state.workflow_runs = []
+    st.session_state.backend_error = ""
+    st.session_state.auth_message = ""
+
+
+# Render login and signup before allowing access to source/chat screens.
+def _render_auth_screen() -> None:
+    if st.session_state.pop("signup_completed", False):
+        st.session_state.auth_mode = "Log in"
+        st.session_state.login_username = st.session_state.pop(
+            "new_account_username",
+            "",
+        )
+        st.session_state.signup_password = ""
+        st.session_state.signup_confirm_password = ""
+        st.session_state.signup_first_name = ""
+        st.session_state.signup_last_name = ""
+        st.session_state.signup_username = ""
+
+    st.markdown(
+        '<div class="mediassist-kicker">MediAssist AI · Secure sign-in</div>',
+        unsafe_allow_html=True,
+    )
+    st.title("Welcome to MediAssist")
+    st.markdown(
+        '<p class="mediassist-subtitle">Sign in to your account or create '
+        "one to continue.</p>",
+        unsafe_allow_html=True,
+    )
+    auth_message = st.session_state.get("auth_message")
+    if auth_message:
+        st.info(auth_message)
+    if st.session_state.get("backend_error"):
+        st.error(st.session_state.backend_error)
+
+    auth_mode = st.radio(
+        "Account access",
+        ["Log in", "Create account"],
+        key="auth_mode",
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    if auth_mode == "Log in":
+        with st.form("login_form"):
+            username = st.text_input("Username", key="login_username")
+            password = st.text_input(
+                "Password",
+                type="password",
+                key="login_password",
+                placeholder="Enter your password",
+            )
+            submitted = st.form_submit_button(
+                "Log in",
+                type="primary",
+                use_container_width=True,
+            )
+        if submitted:
+            try:
+                auth = login_user(get_api_base_url(), username, password)
+                _start_authenticated_session(auth)
+            except APIClientError as error:
+                st.error(auth_error_message(error, "login"))
+            else:
+                st.rerun()
+
+    else:
+        with st.form("signup_form"):
+            first_name = st.text_input("First name", key="signup_first_name")
+            last_name = st.text_input("Last name", key="signup_last_name")
+            username = st.text_input("Username", key="signup_username")
+            password = st.text_input(
+                "Create password",
+                type="password",
+                key="signup_password",
+                placeholder="Example: Snooker@147",
+            )
+            st.caption(
+                "Use 8–128 characters. Start with an uppercase letter and include "
+                "at least one lowercase letter and one number. Special characters "
+                "such as @ are allowed."
+            )
+            confirm_password = st.text_input(
+                "Confirm password",
+                type="password",
+                key="signup_confirm_password",
+                placeholder="Re-enter your password",
+            )
+            submitted = st.form_submit_button(
+                "Create account",
+                type="primary",
+                use_container_width=True,
+            )
+        if submitted:
+            try:
+                validate_password(password)
+                if password != confirm_password:
+                    raise ValueError(
+                        "Passwords do not match. Enter the same password in both fields."
+                    )
+                signup_user(
+                    get_api_base_url(),
+                    first_name,
+                    last_name,
+                    username,
+                    password,
+                    confirm_password,
+                )
+            except APIClientError as error:
+                st.error(auth_error_message(error, "signup"))
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.session_state.auth_message = (
+                    "Your account has been created. Please log in with your new "
+                    "username and password."
+                )
+                st.session_state.new_account_username = username
+                st.session_state.signup_completed = True
+                st.rerun()
 
 
 # Display the latest five complete question/answer pairs in FIFO order.
@@ -427,41 +710,247 @@ def _render_chat_history() -> None:
             st.markdown(exchange.answer)
             if exchange.status == "insufficient_evidence":
                 st.caption("No supporting passages were found in this session's documents.")
+            elif exchange.status == "partial":
+                st.caption("Some planned tasks could not be completed; see the details below.")
             elif exchange.status == "out_of_scope":
                 st.caption("This question is outside MediAssist's supported topics.")
             for citation in exchange.citations:
+                if citation.get("source_type") == "images":
+                    st.caption(f"[{citation['reference']}] {citation['source']} · image")
+                else:
+                    st.caption(
+                        f"[{citation['reference']}] {citation['source']} · "
+                        f"chunk {citation['chunk_number']}"
+                    )
+            for task in exchange.tasks:
+                status_icon = "✓" if task["status"] == "completed" else "!"
                 st.caption(
-                    f"[{citation['reference']}] {citation['source']} · "
-                    f"chunk {citation['chunk_number']}"
+                    f"{status_icon} {task['description']} — {task['status']}: "
+                    f"{task['reason']}"
                 )
+            if exchange.traces:
+                with st.expander("Workflow trace"):
+                    for trace in exchange.traces:
+                        st.caption(
+                            f"{trace.get('node', 'Agent')} · "
+                            f"{trace.get('duration_ms', 0)} ms · "
+                            f"{trace.get('detail', '')}"
+                        )
 
 
-# Submit a question to the session-scoped backend RAG engine.
-def _handle_question() -> None:
-    question = st.chat_input("Ask about MediAssist healthcare policies or SOPs...")
-    if question is None:
+def _render_dashboard() -> None:
+    """Show session-only workflow activity without retaining prompt content."""
+    runs: list[dict[str, object]] = st.session_state.workflow_runs
+    metrics = build_dashboard_metrics(runs)
+    st.markdown(
+        '<div class="mediassist-kicker">MediAssist AI · Phase 22</div>'
+        '<div class="mediassist-dashboard-hero"><h2>Workflow analytics</h2>'
+        "<p>A clear view of your current session's agent activity, evidence, "
+        "and processing time. No prompts or uploaded content are stored here.</p>"
+        "</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "Private to your signed-in UI session · Cleared when you log out or this "
+        "session ends · Maximum 200 recent runs"
+    )
+    if not runs:
+        st.info(
+            "No workflow activity yet. Ask a question in Chat to see response "
+            "status, agent traces, timings, and citation metrics here."
+        )
         return
 
-    with st.spinner("Searching your session's documents…"):
+    total_runs = int(metrics["total_runs"])
+    answered_runs = int(metrics["answered_runs"])
+    answered_percent = round(answered_runs / total_runs * 100) if total_runs else 0
+    task_total = int(metrics["total_tasks"])
+    task_completed = int(metrics["completed_tasks"])
+    task_percent = round(task_completed / task_total * 100) if task_total else 0
+    duration_seconds = int(metrics["median_duration_ms"]) / 1000
+    metric_columns = st.columns(4)
+    metric_columns[0].metric("Workflows", total_runs)
+    metric_columns[1].metric("Fully answered", f"{answered_percent}%")
+    metric_columns[2].metric("Median response time", f"{duration_seconds:.1f} s")
+    metric_columns[3].metric(
+        "Tasks completed",
+        f"{task_completed}/{task_total}",
+        f"{task_percent}% completion" if task_total else "No planned tasks yet",
+    )
+
+    chart_columns = st.columns(2)
+    status_counts = metrics["status_counts"]
+    with chart_columns[0]:
+        st.markdown("#### Workflow outcomes")
+        if isinstance(status_counts, dict) and status_counts:
+            st.bar_chart(status_counts, color="#167d68")
+    with chart_columns[1]:
+        st.markdown("#### Average time by agent")
+        step_durations = metrics["average_step_durations"]
+        if isinstance(step_durations, dict) and step_durations:
+            st.bar_chart(step_durations, color="#77a995")
+        else:
+            st.caption("No completed agent traces are available yet.")
+
+    source_counts = metrics["source_counts"]
+    source_columns = st.columns([1, 2])
+    with source_columns[0]:
+        st.markdown("#### Cited source types")
+        st.metric("Validated citations", int(metrics["citation_count"]))
+        if isinstance(source_counts, dict):
+            st.caption(
+                f"Documents: {source_counts.get('documents', 0)} · "
+                f"Images: {source_counts.get('images', 0)}"
+            )
+    with source_columns[1]:
+        st.markdown("#### Recent runs")
+        st.dataframe(
+            [
+                {
+                    "Time": run.get("timestamp"),
+                    "Outcome": run.get("status"),
+                    "Duration": f"{int(run.get('duration_ms', 0)) / 1000:.1f} s",
+                    "Tasks": len(run.get("tasks", [])),
+                    "Citations": len(run.get("citations", [])),
+                }
+                for run in reversed(runs)
+            ],
+            hide_index=True,
+            width="stretch",
+        )
+
+    st.markdown("#### Agent execution traces")
+    for index, run in reversed(list(enumerate(runs, start=1))):
+        run_traces = run.get("traces", [])
+        with st.expander(
+            f"Run {index} · {run.get('status', 'unknown')} · "
+            f"{int(run.get('duration_ms', 0)) / 1000:.1f} s"
+        ):
+            if not isinstance(run_traces, list) or not run_traces:
+                st.caption("No completed node trace was returned for this run.")
+            else:
+                for trace in run_traces:
+                    if isinstance(trace, dict):
+                        st.markdown(
+                            f"**{trace.get('node', 'Agent')}** · "
+                            f"{trace.get('status', 'unknown')} · "
+                            f"{trace.get('duration_ms', 0)} ms  \n"
+                            f"{trace.get('detail', '')}"
+                        )
+
+
+# Submit a question with recent context and explicitly selected image inputs.
+def _handle_question() -> None:
+    sources: list[SourceFile] = st.session_state.sources
+    image_sources = [source for source in sources if source.kind == "image"]
+    selected_image_ids: list[str] = []
+    if image_sources:
+        selected_image_ids = st.multiselect(
+            "Use uploaded images for this question",
+            options=[source.file_id for source in image_sources],
+            format_func=lambda source_id: next(
+                source.name for source in image_sources if source.file_id == source_id
+            ),
+            key="selected_image_source_ids",
+            max_selections=5,
+        )
+    external_image_approved = st.checkbox(
+        "I confirm these images are authorized for processing by the configured "
+        "external vision provider",
+        key="external_image_approved",
+        help=(
+            "Image bytes are sent to the configured external vision provider only "
+            "when the server also enables external image processing."
+        ),
+    )
+    prompt = st.chat_input(
+        "Ask about MediAssist policies, reports, or uploaded images...",
+        accept_file="multiple",
+        file_type=IMAGE_TYPES,
+        max_upload_size=10,
+    )
+    if prompt is None:
+        return
+
+    if isinstance(prompt, str):
+        question = prompt.strip()
+        attachments = []
+    else:
+        question = prompt.text.strip()
+        attachments = prompt.files
+    if not question:
+        st.warning("Add a question along with any image attachments.")
+        return
+    if len(attachments) + len(selected_image_ids) > 5:
+        st.error("Use no more than five images per question.")
+        return
+    image_files = [
+        (
+            attachment.name,
+            attachment.getvalue(),
+            attachment.type or "application/octet-stream",
+        )
+        for attachment in attachments
+    ]
+    exchanges: list[ChatExchange] = keep_recent_exchanges(
+        st.session_state.chat_exchanges
+    )
+    history = [
+        {"question": exchange.question, "answer": exchange.answer}
+        for exchange in exchanges
+    ]
+
+    started_at = datetime.now().astimezone()
+    with st.spinner("Planning tasks and gathering source evidence…"):
         try:
             response = ask_backend(
                 get_api_base_url(),
                 st.session_state.backend_session_id,
-                question.strip(),
+                st.session_state.access_token,
+                question,
+                image_source_ids=selected_image_ids,
+                history=history,
+                image_files=image_files,
+                external_image_approved=external_image_approved,
             )
         except APIClientError as error:
+            duration_ms = int(
+                (datetime.now().astimezone() - started_at).total_seconds() * 1000
+            )
+            failed_run = _dashboard_run(
+                {"status": "failed"},
+                duration_ms,
+                started_at.isoformat(timespec="seconds"),
+            )
+            st.session_state.workflow_runs = [
+                *st.session_state.workflow_runs,
+                failed_run,
+            ][-MAX_DASHBOARD_RECORDS:]
             st.error(str(error))
             return
 
-    exchanges: list[ChatExchange] = st.session_state.chat_exchanges
+    duration_ms = int(
+        (datetime.now().astimezone() - started_at).total_seconds() * 1000
+    )
+    dashboard_run = _dashboard_run(
+        response,
+        duration_ms,
+        started_at.isoformat(timespec="seconds"),
+    )
+    st.session_state.workflow_runs = [
+        *st.session_state.workflow_runs,
+        dashboard_run,
+    ][-MAX_DASHBOARD_RECORDS:]
     st.session_state.chat_exchanges = keep_recent_exchanges(
         [
             *exchanges,
             ChatExchange(
-                question=question.strip(),
+                question=question,
                 answer=response["answer"],
                 citations=response["citations"],
                 status=response["status"],
+                tasks=response.get("tasks", []),
+                traces=response.get("traces", []),
             ),
         ]
     )
@@ -473,8 +962,22 @@ def main() -> None:
     """Run the standalone Streamlit user interface."""
     _configure_page()
     _initialize_session()
+    if not st.session_state.access_token:
+        _render_auth_screen()
+        return
     _refresh_sources()
     _render_sidebar()
+
+    selected_page = st.radio(
+        "Workspace",
+        ["Chat", "Analytics dashboard"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="workspace_page",
+    )
+    if selected_page == "Analytics dashboard":
+        _render_dashboard()
+        return
 
     st.markdown(
         '<div class="mediassist-kicker">MediAssist AI · Phase 11</div>',

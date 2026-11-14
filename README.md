@@ -23,7 +23,7 @@ MediAssist AI brings hospital knowledge, structured operational data, and medica
 | Embeddings             | Hugging Face models                           |
 | Retrieval              | ChromaDB semantic, lexical, and hybrid search |
 | RAG answer generation  | OpenAI Responses API with source citations    |
-| Agent workflow         | LangGraph                                     |
+| Agent workflow         | LangGraph StateGraph                          |
 | User interface         | Streamlit                                     |
 | API                    | FastAPI                                       |
 | Structured data access | PostgreSQL through an MCP server              |
@@ -45,7 +45,15 @@ Phases 1–3 (requirements, architecture, and project setup) are complete. Devel
 |     9 | Retrieval strategy           | Document top-K retrieval, ranking, and selection                              | Complete |
 |    10 | Enterprise RAG               | Semantic and hybrid retrieval, metadata filters, citations, and RAG engine    | Complete |
 |    11 | Streamlit frontend           | Build chat and file-upload workflows                                          | Complete |
-|    12 | FastAPI backend              | Expose chat and upload APIs                                                   | Current  |
+|    12 | FastAPI backend              | Expose chat and upload APIs                                                   | Complete |
+|    13 | Account authentication       | Add signup, login, and authenticated access to user-owned sources              | Complete |
+|    14 | Multimodal agent             | Analyze selected or attached images with explicit external-processing approval | Complete |
+|    15 | Planner agent                | Classify intent and decompose requests into bounded tasks                     | Complete |
+|    16 | Retriever agent              | Retrieve account-scoped document evidence for planned tasks                   | Complete |
+|    19 | Reasoning agent              | Synthesize cited evidence and report incomplete tasks                         | Complete |
+|    20 | Agent orchestration          | Route specialist agents through a conditional LangGraph workflow              | Complete |
+|    22 | Analytics dashboard          | Display current-session workflow metrics and content-free execution traces     | Complete |
+|    24 | Guardrails and governance    | Apply prototype input/output controls and document residual risks              | Initial implementation |
 
 The project tracker remains the source of truth for detailed tasks, deliverables, and status.
 
@@ -77,15 +85,25 @@ credentials in this file, not in Python source or documentation:
 ```dotenv
 OPENAI_KEY=your-openai-api-key
 OPENAI_CHAT_MODEL=gpt-4o-mini
+OPENAI_VISION_MODEL=gpt-4o-mini
+MEDIASSIST_ALLOW_EXTERNAL_VISION=false
+MEDIASSIST_ENABLE_LANGSMITH=false
+LANGSMITH_PROJECT=mediassist-healthcare
 DEFAULT_MODEL_NAME=sentence-transformers/all-MiniLM-L6-v2
 ```
 
 The `.env` file is ignored by Git. The application loads `OPENAI_KEY` as
-`OPENAI_API_KEY` for the Phase 10 OpenAI SDK. `OPENAI_CHAT_MODEL` configures
-answer generation; `DEFAULT_MODEL_NAME` configures local Hugging Face
-embeddings. Phase 6 embedding generation remains local. Phase 10 sends the
-question and retrieved document chunks to OpenAI; do not use patient or other
-sensitive data without explicit organizational and provider approval.
+`OPENAI_API_KEY` for the OpenAI SDK. `OPENAI_CHAT_MODEL` configures text
+planning and answer generation; `DEFAULT_MODEL_NAME` configures local Hugging
+Face embeddings. Image analysis uses `OPENAI_VISION_MODEL` and is disabled by
+default; enabling it requires `MEDIASSIST_ALLOW_EXTERNAL_VISION=true` on the
+backend and a separate user confirmation in the UI. Do not use patient or
+other sensitive data without explicit authorization and governance review.
+See the [guardrails and governance guide](src/mediassist_healthcare/docs/guardrails-and-governance.md)
+for data-flow controls and limitations.
+LangSmith tracing is optional and disabled by default. To enable metadata-only
+traces, set `MEDIASSIST_ENABLE_LANGSMITH=true` and `LANGSMITH_API_KEY` on the
+backend after reviewing the data-handling implications.
 
 ## Run the document loader
 
@@ -208,21 +226,77 @@ re-indexed before lexical or hybrid retrieval can use their terms. Use only
 authorized, non-sensitive sample data unless data processing has received
 explicit approval.
 
-## Phases 11–12: Streamlit frontend and FastAPI backend
+## Phases 11–13: Frontend, backend, and account authentication
 
 The standalone Streamlit interface follows the provided template: a left-hand
-sidebar for document and image sources, and a MediAssist chat area. Add one
-PDF, DOCX, or TXT document per upload action, or one PNG, JPG, JPEG, or WEBP
-image per action. Added source names appear below their upload sections and
-can be removed from the current session. The chat retains at most five complete
+sidebar for sources and a MediAssist chat area. A single upload control accepts
+one PDF, DOCX, TXT, PNG, JPG, JPEG, or WEBP file per action. Documents and
+images up to 10 MB each appear together in the source list and can be removed
+from the current session. The chat retains at most five complete
 question/answer pairs, dropping the oldest pair first (FIFO).
 
-The UI connects to the Phase 12 FastAPI backend. Document uploads are
+The UI connects to the FastAPI backend. Document uploads are
 extracted, chunked, embedded locally, and indexed in ChromaDB. Image uploads
-are stored and can be removed, but are not analyzed with OCR or vision in this
-phase. Chat and search are restricted to documents uploaded in that browser
-session. The chat continues to show at most five complete question/answer
-pairs, dropping the oldest pair first.
+are stored and can be removed. Users can create an account with their name, username, and password,
+then sign in to access their own uploaded sources. Passwords are stored as
+salted PBKDF2 hashes. Signup passwords must start with an uppercase letter and
+contain lowercase letters and a number; special characters are allowed.
+After signup, users are returned to the login form and must sign in separately.
+Bearer sessions expire after 30 minutes and are revoked on logout. The
+prototype has one account type and no role-based permissions.
+Chat and search are restricted to the signed-in account's documents; selected
+stored images are also checked for account ownership.
+
+## Phases 14–16, 19–20, and 22: Agent workflow and analytics
+
+Chat requests run through a LangGraph workflow: the planner classifies
+the request and creates up to six document, image, or MCP tasks; the retriever
+searches only the authenticated account's documents; the multimodal agent
+analyzes selected stored images or new chat attachments; and the reasoning
+agent returns an answer with validated `[D1]` document or `[I1]` image
+citations and a completion status for each task. The UI can select previously
+uploaded images, attach new images to a question, or combine both (up to five
+images total). Direct attachments are processed in memory and are not saved as
+uploaded sources.
+
+Image bytes are sent to the configured external vision provider only when
+`MEDIASSIST_ALLOW_EXTERNAL_VISION=true` is set by the backend operator **and**
+the user confirms approval in the UI. The default is disabled. This text and
+vision workflow is an educational prototype; it is not clinical decision
+support validated for patient care. Phase 18 MCP integration is not implemented,
+so MCP tasks are explicitly reported as incomplete. LangGraph orchestration
+(Phase 20) routes planner, retriever, optional multimodal, and reasoning nodes,
+with conditional paths for out-of-scope questions and image requests.
+The Analytics dashboard (Phase 22) summarizes workflows, answer status,
+durations, task completion, citation types, and agent traces. It is scoped to
+the current signed-in UI session, keeps a maximum of 200 content-free records,
+and clears them at logout/session end. It does not persist prompts, answers,
+documents, images, or model payloads. See the [backend API guide](src/mediassist_healthcare/docs/backend-api.md)
+and [guardrails and governance guide](src/mediassist_healthcare/docs/guardrails-and-governance.md).
+
+## Phases 24–25: Security guardrails and observability
+
+The prototype applies bounded input and upload validation, best-effort
+identifier masking, limited prompt-override checks, account-scoped access,
+evidence/citation validation, safe generic server errors, request IDs, and
+baseline response security headers. Application logs use an allowlist of
+operational metadata and do not include prompts, answers, retrieved text,
+image bytes, or exception messages. These controls are not production security
+certification, PHI de-identification, or an audit platform.
+
+Each answer then passes a separate output-guardrail stage that checks basic
+safety patterns and verifies citations against available evidence. When an
+incomplete task has no evidence, the workflow gives the relevant retriever or
+image analyzer task-specific feedback and allows one bounded recovery pass.
+Safety-rejected answers are replaced with a refusal and are never retried.
+
+Local structured workflow/API events are enabled by default. Optional
+LangSmith tracing is disabled by default and, when explicitly enabled with
+`MEDIASSIST_ENABLE_LANGSMITH=true` and `LANGSMITH_API_KEY`, sends only fixed
+workflow/node labels and aggregate counts/timings. The LangGraph workflow
+disables ambient tracing to prevent accidental graph-state export. See the
+[governance guide](src/mediassist_healthcare/docs/guardrails-and-governance.md)
+for configuration and residual risks.
 
 Install dependencies once:
 
@@ -245,7 +319,7 @@ The API listens on `http://127.0.0.1:8000` by default. Configure
 `MEDIASSIST_API_URL` in `.env` if the backend uses another local address.
 Interactive API documentation is available at `http://127.0.0.1:8000/docs`.
 See the [backend API guide](src/mediassist_healthcare/docs/backend-api.md) for
-endpoints, storage behavior, and prototype limitations.
+authentication, endpoints, storage behavior, and prototype limitations.
 
 ## Run tests
 
@@ -268,10 +342,11 @@ README.md                    Project overview, setup, and learning roadmap
 - Use only authorized project datasets and documents.
 - Do not commit credentials, secrets, or real patient information.
 - Patient-data access will be mediated by role-aware MCP tools; AI agents must not connect directly to PostgreSQL.
+- Identifier masking is best effort, not certified de-identification; image bytes are not redacted.
 - Validate AI outputs against sources and have qualified people review consequential clinical decisions.
 
 ## Next step
 
-Phase 12 is in progress: validate the connected frontend and backend using
-authorized, non-sensitive sample documents before adding OCR or other
-multimodal processing.
+Continue with the next tracker-approved phase after reviewing and validating
+the current agent workflow using authorized, non-sensitive sample data. Phase
+18 (MCP integration) has not been implemented.

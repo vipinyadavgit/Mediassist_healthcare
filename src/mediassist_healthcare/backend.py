@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
+import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -12,20 +14,38 @@ from pathlib import Path
 from typing import Generator, Literal
 from zipfile import BadZipFile
 
-from fastapi import FastAPI, File, Request, UploadFile
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 from pypdf.errors import PdfReadError
 from starlette.responses import JSONResponse
 
+from mediassist_healthcare.auth import (
+    AuthenticatedUser,
+    AuthService,
+    InvalidCredentialsError,
+    LoginSession,
+    UsernameTakenError,
+)
+from mediassist_healthcare.agent_Orchestration import AgentWorkflow
 from mediassist_healthcare.embeddings import HuggingFaceEmbedder
+from mediassist_healthcare.guardrails import (
+    ConversationTurn,
+    GuardrailViolation,
+    MAX_IMAGES_PER_QUESTION,
+)
 from mediassist_healthcare.ingestion import load_document
-from mediassist_healthcare.rag import RAGEngine, RAGGenerationError
+from mediassist_healthcare.multimodal_agent import ImageInput, MultimodalAgent
+from mediassist_healthcare.observability import log_safe_event, safe_exception_fields
+from mediassist_healthcare.planner_agent import PlannerAgent
 from mediassist_healthcare.retriever import RetrievalMode, RetrievedChunk, Retriever
+from mediassist_healthcare.reasoning_agent import ReasoningAgent
+from mediassist_healthcare.retriever_agent import RetrieverAgent
 from mediassist_healthcare.settings import PROJECT_ROOT, get_embedding_model_name
 from mediassist_healthcare.text_processing import chunk_by_paragraph
 from mediassist_healthcare.vector_store import ChromaVectorStore
 
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+MAX_UPLOAD_BYTES = 10_000_000
 DOCUMENT_EXTENSIONS = {".pdf", ".docx", ".txt"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 DEFAULT_API_DATA_DIRECTORY = PROJECT_ROOT / "output" / "mediassist_api"
@@ -44,6 +64,41 @@ class SourceNotFoundError(LookupError):
 
 class BackendProcessingError(RuntimeError):
     """Report a backend processing failure that the caller can retry."""
+
+
+class SignupRequest(BaseModel):
+    """Collect a single account's name, username, and password at signup."""
+
+    first_name: str = Field(min_length=1, max_length=80)
+    last_name: str = Field(min_length=1, max_length=80)
+    username: str = Field(min_length=3, max_length=32)
+    password: str = Field(min_length=1, max_length=128)
+    confirm_password: str = Field(min_length=1, max_length=128)
+
+
+class LoginRequest(BaseModel):
+    """Collect a username/password pair at login."""
+
+    username: str = Field(min_length=1, max_length=32)
+    password: str = Field(min_length=1, max_length=128)
+
+
+class UserProfileResponse(BaseModel):
+    """Expose account identity without password or credential-hash data."""
+
+    user_id: str
+    first_name: str
+    last_name: str
+    username: str
+
+
+class AuthResponse(BaseModel):
+    """Return a bearer session token and the authenticated user profile."""
+
+    access_token: str
+    token_type: Literal["bearer"] = "bearer"
+    expires_at: float
+    user: UserProfileResponse
 
 
 @dataclass(frozen=True)
@@ -82,6 +137,7 @@ class CitationResponse(BaseModel):
     reference: str
     source: str
     chunk_number: int
+    source_type: Literal["documents", "images"] = "documents"
     distance: float | None = None
 
 
@@ -94,11 +150,33 @@ class SearchRequest(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    """Describe one user question for the RAG engine."""
+    """Describe one agent workflow request and its bounded optional context."""
 
     question: str = Field(min_length=1, max_length=4000)
     mode: RetrievalMode = "hybrid"
     top_k: int = Field(default=5, ge=1, le=100)
+    image_source_ids: list[str] = Field(default_factory=list, max_length=5)
+    history: list[dict[str, str]] = Field(default_factory=list, max_length=5)
+    external_image_approved: bool = False
+
+
+class TaskOutcomeResponse(BaseModel):
+    """Return one planned task's completion status and reason."""
+
+    task_id: str
+    description: str
+    source: Literal["documents", "images", "mcp"]
+    status: Literal["completed", "incomplete"]
+    reason: str
+
+
+class WorkflowTraceResponse(BaseModel):
+    """Expose a non-sensitive workflow node trace to the current UI session."""
+
+    node: str
+    status: Literal["completed", "failed"]
+    duration_ms: int
+    detail: str
 
 
 class SearchResult(BaseModel):
@@ -112,13 +190,22 @@ class SearchResult(BaseModel):
 
 
 class ChatResponse(BaseModel):
-    """Return the RAG answer and its validated source citations."""
+    """Return the agent answer, task outcomes, and validated source citations."""
 
     answer: str
-    status: Literal["answered", "out_of_scope", "insufficient_evidence"]
+    status: Literal[
+        "answered",
+        "partial",
+        "out_of_scope",
+        "insufficient_evidence",
+    ]
     citations: list[CitationResponse]
     retrieval_mode: RetrievalMode
     model: str
+    intent: str = ""
+    complexity: Literal["single_step", "multi_step"] = "single_step"
+    tasks: list[TaskOutcomeResponse] = Field(default_factory=list)
+    traces: list[WorkflowTraceResponse] = Field(default_factory=list)
 
 
 # Store the file catalog outside ChromaDB so images can also be listed/removed.
@@ -232,7 +319,7 @@ class SourceCatalog:
 
 
 class BackendService:
-    """Coordinate uploads, local indexing, session filters, and RAG requests."""
+    """Coordinate account-owned uploads, local retrieval, and agent workflows."""
 
     def __init__(
         self,
@@ -241,15 +328,16 @@ class BackendService:
         store: ChromaVectorStore | None = None,
         embedder: HuggingFaceEmbedder | None = None,
         retriever: Retriever | None = None,
-        rag_engine: RAGEngine | None = None,
+        agent_workflow: AgentWorkflow | None = None,
     ) -> None:
         """Create a service with lazy project components and injectable test doubles."""
         self.upload_directory = upload_directory
         self.catalog = SourceCatalog(catalog_path)
+        self.auth = AuthService(catalog_path)
         self._store = store
         self._embedder = embedder
         self._retriever = retriever
-        self._rag_engine = rag_engine
+        self._agent_workflow = agent_workflow
 
     # Validate session identifiers before using them in catalog filters or paths.
     @staticmethod
@@ -289,6 +377,101 @@ class BackendService:
                 f"The uploaded content does not match the {suffix[1:].upper()} image type."
             )
 
+    # Map validated image extensions to stable media types for the vision API.
+    @staticmethod
+    def _image_media_type(filename: str) -> str:
+        media_types = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".webp": "image/webp",
+        }
+        media_type = media_types.get(Path(filename).suffix.casefold())
+        if media_type is None:
+            raise APIInputError("Choose a supported image file.")
+        return media_type
+
+    # Load only image records owned by this account and keep bytes in memory.
+    def _load_selected_images(
+        self,
+        session_id: str,
+        image_source_ids: list[str],
+    ) -> list[ImageInput]:
+        if len(image_source_ids) > MAX_IMAGES_PER_QUESTION:
+            raise APIInputError(
+                f"Use no more than {MAX_IMAGES_PER_QUESTION} images per question."
+            )
+        images: list[ImageInput] = []
+        seen_ids: set[str] = set()
+        for source_id in image_source_ids:
+            try:
+                normalized_id = str(uuid.UUID(source_id))
+            except ValueError as error:
+                raise APIInputError("An image source ID is invalid.") from error
+            if normalized_id in seen_ids:
+                continue
+            seen_ids.add(normalized_id)
+            source = self.catalog.get_for_session(session_id, normalized_id)
+            if source is None or source.kind != "image":
+                raise SourceNotFoundError("The requested image source was not found.")
+            if source.size_bytes > MAX_UPLOAD_BYTES:
+                raise APIInputError("The selected image exceeds the 10 MB limit.")
+            storage_path = Path(source.storage_path).resolve()
+            upload_root = (self.upload_directory / session_id).resolve()
+            if not storage_path.is_relative_to(upload_root):
+                raise SourceNotFoundError("The requested image source was not found.")
+            try:
+                content = storage_path.read_bytes()
+            except OSError as error:
+                raise BackendProcessingError(
+                    "A selected image could not be read from local storage."
+                ) from error
+            if len(content) > MAX_UPLOAD_BYTES:
+                raise APIInputError("The selected image exceeds the 10 MB limit.")
+            self._validate_image_signature(source.name, content)
+            images.append(
+                ImageInput(
+                    reference=f"I{len(images) + 1}",
+                    name=source.name,
+                    media_type=self._image_media_type(source.name),
+                    content=content,
+                )
+            )
+        return images
+
+    # Validate direct chat image attachments without persisting them as account sources.
+    async def read_chat_images(
+        self,
+        uploads: list[UploadFile],
+    ) -> list[ImageInput]:
+        """Read at most five supported, signature-checked image attachments."""
+        if len(uploads) > MAX_IMAGES_PER_QUESTION:
+            raise APIInputError(
+                f"Attach no more than {MAX_IMAGES_PER_QUESTION} images per question."
+            )
+        images: list[ImageInput] = []
+        for upload in uploads:
+            name = self._safe_filename(upload.filename)
+            if Path(name).suffix.casefold() not in IMAGE_EXTENSIONS:
+                raise APIInputError(
+                    "Chat attachments must be PNG, JPG, JPEG, or WEBP images."
+                )
+            content = await upload.read(MAX_UPLOAD_BYTES + 1)
+            if not content:
+                raise APIInputError("An attached image is empty.")
+            if len(content) > MAX_UPLOAD_BYTES:
+                raise APIInputError("An attached image exceeds the 10 MB limit.")
+            self._validate_image_signature(name, content)
+            images.append(
+                ImageInput(
+                    reference=f"I{len(images) + 1}",
+                    name=name,
+                    media_type=self._image_media_type(name),
+                    content=content,
+                )
+            )
+        return images
+
     # Validate a single upload and persist it under generated session/file IDs.
     async def upload(
         self,
@@ -311,7 +494,7 @@ class BackendService:
         if not content:
             raise APIInputError("The uploaded file is empty.")
         if len(content) > MAX_UPLOAD_BYTES:
-            raise APIInputError("The uploaded file exceeds the 20 MB limit.")
+            raise APIInputError("The uploaded file exceeds the 10 MB limit.")
         if kind == "image":
             self._validate_image_signature(name, content)
 
@@ -464,41 +647,77 @@ class BackendService:
             ) from error
         return [self._search_result(chunk) for chunk in chunks]
 
-    # Ask the RAG engine to answer using only this session's indexed documents.
-    def chat(self, session_id: str, request: ChatRequest) -> ChatResponse:
-        """Generate a scoped, evidence-grounded answer for one session."""
+    # Run the multi-agent workflow using only this account's documents and images.
+    def chat(
+        self,
+        session_id: str,
+        request: ChatRequest,
+        direct_images: list[ImageInput] | None = None,
+    ) -> ChatResponse:
+        """Plan, retrieve, analyze optional images, and verify response evidence."""
         session_id = self.validate_session_id(session_id)
-        if not request.question.strip():
-            raise APIInputError("The question cannot be empty.")
-        try:
-            response = self._get_rag_engine().ask(
-                request.question,
-                top_k=request.top_k,
-                retrieval_mode=request.mode,
-                metadata_filter={"session_id": session_id},
+        selected_images = self._load_selected_images(
+            session_id,
+            request.image_source_ids,
+        )
+        selected_images.extend(direct_images or [])
+        if len(selected_images) > MAX_IMAGES_PER_QUESTION:
+            raise APIInputError(
+                f"Use no more than {MAX_IMAGES_PER_QUESTION} images per question."
             )
-        except RAGGenerationError as error:
+        selected_images = [
+            ImageInput(
+                reference=f"I{index}",
+                name=image.name,
+                media_type=image.media_type,
+                content=image.content,
+            )
+            for index, image in enumerate(selected_images, start=1)
+        ]
+        history: list[ConversationTurn] = []
+        for turn in request.history:
+            question = turn.get("question", "")
+            answer = turn.get("answer", "")
+            if question and answer:
+                history.append(ConversationTurn(question=question, answer=answer))
+        try:
+            response = self._get_agent_workflow().run(
+                request.question,
+                session_id=session_id,
+                top_k=request.top_k,
+                mode=request.mode,
+                images=selected_images,
+                history=history,
+                external_image_approved=request.external_image_approved,
+            )
+        except GuardrailViolation as error:
+            raise APIInputError(str(error)) from error
+        except RuntimeError as error:
+            log_safe_event(
+                _LOGGER,
+                "workflow.failed",
+                **safe_exception_fields(error),
+            )
             raise BackendProcessingError(
-                "The RAG service could not complete this question. Check the "
-                "OpenAI configuration and service connection."
+                "The agent workflow could not complete this question. Check the "
+                "model configuration, local retrieval services, and provider connection."
             ) from error
-        except (ImportError, OSError, RuntimeError, ValueError) as error:
+        except (ImportError, OSError, ValueError) as error:
+            log_safe_event(
+                _LOGGER,
+                "workflow.local_dependency_failed",
+                **safe_exception_fields(error),
+            )
             raise BackendProcessingError(
-                "The RAG service could not access its local model or vector store."
+                "The agent workflow could not access its local model or vector store."
             ) from error
 
-        source_names = {
-            str(chunk.metadata.get("source", "")): str(
-                chunk.metadata.get("filename")
-                or Path(str(chunk.metadata.get("source", ""))).name
-            )
-            for chunk in response.retrieved_chunks
-        }
         citations = [
             CitationResponse(
                 reference=citation.reference,
-                source=source_names.get(citation.source, Path(citation.source).name),
+                source=citation.source,
                 chunk_number=citation.chunk_number,
+                source_type=citation.source_type,
                 distance=citation.distance,
             )
             for citation in response.citations
@@ -509,6 +728,27 @@ class BackendService:
             citations=citations,
             retrieval_mode=response.retrieval_mode,
             model=response.model,
+            intent=response.intent,
+            complexity=response.complexity,
+            tasks=[
+                TaskOutcomeResponse(
+                    task_id=task.task_id,
+                    description=task.description,
+                    source=task.source,
+                    status=task.status,
+                    reason=task.reason,
+                )
+                for task in response.task_outcomes
+            ],
+            traces=[
+                WorkflowTraceResponse(
+                    node=trace.node,
+                    status=trace.status,
+                    duration_ms=trace.duration_ms,
+                    detail=trace.detail,
+                )
+                for trace in response.traces
+            ],
         )
 
     # Build the default local vector store only when a document/search needs it.
@@ -536,11 +776,16 @@ class BackendService:
             )
         return self._retriever
 
-    # Reuse the Phase 10 engine for API chat requests.
-    def _get_rag_engine(self) -> RAGEngine:
-        if self._rag_engine is None:
-            self._rag_engine = RAGEngine(self._get_retriever())
-        return self._rag_engine
+    # Build the lightweight requested-agent workflow without requiring LangGraph.
+    def _get_agent_workflow(self) -> AgentWorkflow:
+        if self._agent_workflow is None:
+            self._agent_workflow = AgentWorkflow(
+                planner=PlannerAgent(),
+                retriever=RetrieverAgent(self._get_retriever()),
+                multimodal=MultimodalAgent(),
+                reasoner=ReasoningAgent(),
+            )
+        return self._agent_workflow
 
     # Convert an internal source record to the public API response model.
     @staticmethod
@@ -589,10 +834,102 @@ def create_app(service: BackendService | None = None) -> FastAPI:
         version="0.1.0",
     )
 
+    @app.middleware("http")
+    async def observe_request(request: Request, call_next):
+        request_id = str(uuid.uuid4())
+        request.state.request_id = request_id
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        except Exception as error:
+            route = getattr(request.scope.get("route"), "path", "/unmatched")
+            log_safe_event(
+                _LOGGER,
+                "http.request_failed",
+                request_id=request_id,
+                method=request.method,
+                route=route,
+                **safe_exception_fields(error),
+            )
+            response = JSONResponse(
+                status_code=500,
+                content={
+                    "detail": (
+                        "An unexpected server error occurred. Please try again "
+                        "or contact support with the request ID."
+                    )
+                },
+            )
+
+        route = getattr(request.scope.get("route"), "path", "/unmatched")
+        duration_ms = max(0, round((time.perf_counter() - started) * 1000))
+        log_safe_event(
+            _LOGGER,
+            "http.request_completed",
+            request_id=request_id,
+            method=request.method,
+            route=route,
+            http_status=response.status_code,
+            duration_ms=duration_ms,
+        )
+        response.headers["X-Request-ID"] = request_id
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["Permissions-Policy"] = (
+            "camera=(), microphone=(), geolocation=()"
+        )
+        return response
+    bearer_scheme = HTTPBearer(auto_error=False)
+
+    # Require a valid bearer session for every private API workflow.
+    def require_user(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+    ) -> AuthenticatedUser:
+        if credentials is None or credentials.scheme.casefold() != "bearer":
+            raise HTTPException(
+                status_code=401,
+                detail="Sign in to use this endpoint.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        user = backend.auth.authenticate(credentials.credentials)
+        if user is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Your session is invalid or expired. Please sign in again.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        return user
+
+    # Bind the legacy session path segment to the authenticated account ID.
+    def require_own_session(session_id: str, user: AuthenticatedUser) -> None:
+        normalized_session_id = backend.validate_session_id(session_id)
+        if normalized_session_id != user.user_id:
+            raise SourceNotFoundError("The requested session was not found.")
+
+    # Convert an issued login session to the public API response.
+    def auth_response(session: LoginSession) -> AuthResponse:
+        return AuthResponse(
+            access_token=session.access_token,
+            expires_at=session.expires_at,
+            user=UserProfileResponse(
+                user_id=session.user.user_id,
+                first_name=session.user.first_name,
+                last_name=session.user.last_name,
+                username=session.user.username,
+            ),
+        )
+
     # Translate explicit service errors into stable API status codes.
     @app.exception_handler(APIInputError)
     async def handle_input_error(request: Request, error: APIInputError):
-        _LOGGER.info("Rejected API request to %s: %s", request.url.path, error)
+        log_safe_event(
+            _LOGGER,
+            "http.request_rejected",
+            request_id=getattr(request.state, "request_id", ""),
+            http_status=422,
+        )
         return JSONResponse(
             status_code=422,
             content={"detail": str(error), "path": request.url.path},
@@ -600,15 +937,35 @@ def create_app(service: BackendService | None = None) -> FastAPI:
 
     @app.exception_handler(SourceNotFoundError)
     async def handle_missing_source(request: Request, error: SourceNotFoundError):
-        _LOGGER.info("Source not found for API request to %s", request.url.path)
+        log_safe_event(
+            _LOGGER,
+            "http.source_not_found",
+            request_id=getattr(request.state, "request_id", ""),
+            http_status=404,
+        )
         return JSONResponse(
             status_code=404,
             content={"detail": str(error), "path": request.url.path},
         )
 
+    @app.exception_handler(UsernameTakenError)
+    async def handle_duplicate_username(request: Request, error: UsernameTakenError):
+        log_safe_event(
+            _LOGGER,
+            "auth.signup_rejected",
+            request_id=getattr(request.state, "request_id", ""),
+            http_status=409,
+        )
+        return JSONResponse(status_code=409, content={"detail": str(error)})
+
     @app.exception_handler(BackendProcessingError)
     async def handle_processing_error(request: Request, error: BackendProcessingError):
-        _LOGGER.error("Backend processing failed for %s: %s", request.url.path, error)
+        log_safe_event(
+            _LOGGER,
+            "http.processing_failed",
+            request_id=getattr(request.state, "request_id", ""),
+            http_status=503,
+        )
         return JSONResponse(
             status_code=503,
             content={"detail": str(error), "path": request.url.path},
@@ -619,6 +976,71 @@ def create_app(service: BackendService | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok", "service": "mediassist-healthcare-api"}
 
+    # Create an account without issuing a bearer token; login is a separate step.
+    @app.post("/api/auth/signup", response_model=UserProfileResponse, status_code=201)
+    def signup(request: SignupRequest) -> UserProfileResponse:
+        if request.password != request.confirm_password:
+            raise APIInputError("Password and confirmation do not match.")
+        try:
+            user = backend.auth.signup(
+                request.first_name,
+                request.last_name,
+                request.username,
+                request.password,
+            )
+        except UsernameTakenError:
+            raise
+        except ValueError as error:
+            raise APIInputError(str(error)) from error
+        return UserProfileResponse(
+            user_id=user.user_id,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            username=user.username,
+        )
+
+    # Verify a returning user's username and password and return a bearer token.
+    @app.post("/api/auth/login", response_model=AuthResponse)
+    def login(request: LoginRequest) -> AuthResponse:
+        try:
+            session = backend.auth.login(request.username, request.password)
+        except InvalidCredentialsError as error:
+            raise HTTPException(
+                status_code=401,
+                detail=str(error),
+                headers={"WWW-Authenticate": "Bearer"},
+            ) from error
+        except ValueError as error:
+            raise APIInputError(str(error)) from error
+        return auth_response(session)
+
+    # Return the current authenticated profile without exposing credential fields.
+    @app.get("/api/auth/me", response_model=UserProfileResponse)
+    def current_user(
+        user: AuthenticatedUser = Depends(require_user),
+    ) -> UserProfileResponse:
+        return UserProfileResponse(
+            user_id=user.user_id,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            username=user.username,
+        )
+
+    # Revoke the current bearer token at logout.
+    @app.post("/api/auth/logout")
+    def logout(
+        credentials: HTTPAuthorizationCredentials | None = Depends(bearer_scheme),
+        _user: AuthenticatedUser = Depends(require_user),
+    ) -> dict[str, str]:
+        if credentials is None:
+            raise HTTPException(
+                status_code=401,
+                detail="Sign in to use this endpoint.",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        backend.auth.logout(credentials.credentials)
+        return {"status": "signed_out"}
+
     # Accept and index one PDF, DOCX, or TXT document.
     @app.post(
         "/api/sessions/{session_id}/documents",
@@ -628,7 +1050,9 @@ def create_app(service: BackendService | None = None) -> FastAPI:
     async def upload_document(
         session_id: str,
         file: UploadFile = File(...),
+        user: AuthenticatedUser = Depends(require_user),
     ) -> UploadResponse:
+        require_own_session(session_id, user)
         return await backend.upload(session_id, "document", file)
 
     # Accept one image and retain it for source management without OCR/vision.
@@ -640,7 +1064,9 @@ def create_app(service: BackendService | None = None) -> FastAPI:
     async def upload_image(
         session_id: str,
         file: UploadFile = File(...),
+        user: AuthenticatedUser = Depends(require_user),
     ) -> UploadResponse:
+        require_own_session(session_id, user)
         return await backend.upload(session_id, "image", file)
 
     # Return the uploaded sources for the current browser session.
@@ -648,12 +1074,21 @@ def create_app(service: BackendService | None = None) -> FastAPI:
         "/api/sessions/{session_id}/sources",
         response_model=list[SourceResponse],
     )
-    def list_sources(session_id: str) -> list[SourceResponse]:
+    def list_sources(
+        session_id: str,
+        user: AuthenticatedUser = Depends(require_user),
+    ) -> list[SourceResponse]:
+        require_own_session(session_id, user)
         return backend.list_sources(session_id)
 
     # Delete one session-owned upload and its vectors if it is a document.
     @app.delete("/api/sessions/{session_id}/sources/{file_id}", status_code=204)
-    def delete_source(session_id: str, file_id: str) -> None:
+    def delete_source(
+        session_id: str,
+        file_id: str,
+        user: AuthenticatedUser = Depends(require_user),
+    ) -> None:
+        require_own_session(session_id, user)
         backend.delete_source(session_id, file_id)
 
     # Return retrieval candidates for development and evaluation workflows.
@@ -661,7 +1096,12 @@ def create_app(service: BackendService | None = None) -> FastAPI:
         "/api/sessions/{session_id}/search",
         response_model=list[SearchResult],
     )
-    def search(session_id: str, request: SearchRequest) -> list[SearchResult]:
+    def search(
+        session_id: str,
+        request: SearchRequest,
+        user: AuthenticatedUser = Depends(require_user),
+    ) -> list[SearchResult]:
+        require_own_session(session_id, user)
         return backend.search(session_id, request)
 
     # Return an answer and its source citations for the current session.
@@ -669,8 +1109,56 @@ def create_app(service: BackendService | None = None) -> FastAPI:
         "/api/sessions/{session_id}/chat",
         response_model=ChatResponse,
     )
-    def chat(session_id: str, request: ChatRequest) -> ChatResponse:
+    def chat(
+        session_id: str,
+        request: ChatRequest,
+        user: AuthenticatedUser = Depends(require_user),
+    ) -> ChatResponse:
+        require_own_session(session_id, user)
         return backend.chat(session_id, request)
+
+    # Accept direct image attachments alongside selected stored image sources.
+    @app.post(
+        "/api/sessions/{session_id}/chat/with-images",
+        response_model=ChatResponse,
+    )
+    async def chat_with_images(
+        session_id: str,
+        question: str = Form(..., min_length=1, max_length=4000),
+        mode: RetrievalMode = Form("hybrid"),
+        top_k: int = Form(5, ge=1, le=100),
+        image_source_ids: str = Form("[]"),
+        history: str = Form("[]"),
+        external_image_approved: bool = Form(False),
+        image_files: list[UploadFile] = File(default=[]),
+        user: AuthenticatedUser = Depends(require_user),
+    ) -> ChatResponse:
+        require_own_session(session_id, user)
+        try:
+            selected_ids = json.loads(image_source_ids)
+            conversation = json.loads(history)
+        except json.JSONDecodeError as error:
+            raise APIInputError(
+                "Image source IDs and conversation history must be valid JSON."
+            ) from error
+        if not isinstance(selected_ids, list) or not all(
+            isinstance(source_id, str) for source_id in selected_ids
+        ):
+            raise APIInputError("Image source IDs must be a JSON string array.")
+        if not isinstance(conversation, list) or not all(
+            isinstance(turn, dict) for turn in conversation
+        ):
+            raise APIInputError("Conversation history must be a JSON object array.")
+        request = ChatRequest(
+            question=question,
+            mode=mode,
+            top_k=top_k,
+            image_source_ids=selected_ids,
+            history=conversation,
+            external_image_approved=external_image_approved,
+        )
+        direct_images = await backend.read_chat_images(image_files)
+        return backend.chat(session_id, request, direct_images=direct_images)
 
     app.state.backend_service = backend
     return app
@@ -688,6 +1176,7 @@ def main() -> None:
         "mediassist_healthcare.backend:app",
         host="127.0.0.1",
         port=8000,
+        access_log=False,
     )
 
 

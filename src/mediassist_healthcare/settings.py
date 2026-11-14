@@ -11,6 +11,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 ENV_FILE = PROJECT_ROOT / ".env"
 DEFAULT_EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 DEFAULT_OPENAI_CHAT_MODEL = "gpt-4o-mini"
+DEFAULT_OPENAI_VISION_MODEL = "gpt-4o-mini"
 DEFAULT_API_BASE_URL = "http://127.0.0.1:8000"
 
 
@@ -38,6 +39,30 @@ def get_embedding_model_name() -> str:
 def get_openai_chat_model_name() -> str:
     """Read the answer-generation model ID from the environment."""
     return os.getenv("OPENAI_CHAT_MODEL", DEFAULT_OPENAI_CHAT_MODEL)
+
+
+# Return the configured model used to inspect image content.
+def get_openai_vision_model_name() -> str:
+    """Read the vision model ID from the environment."""
+    return os.getenv("OPENAI_VISION_MODEL", DEFAULT_OPENAI_VISION_MODEL)
+
+
+# Require an explicit server-side opt-in before sending image bytes to a provider.
+def external_vision_is_enabled() -> bool:
+    """Return whether external image processing has been explicitly approved."""
+    return os.getenv("MEDIASSIST_ALLOW_EXTERNAL_VISION", "").strip().casefold() == "true"
+
+
+# Require both an explicit opt-in and a LangSmith API key before external traces.
+def langsmith_tracing_is_enabled() -> bool:
+    """Return whether metadata-only LangSmith tracing is enabled by the operator."""
+    return os.getenv("MEDIASSIST_ENABLE_LANGSMITH", "").strip().casefold() == "true"
+
+
+# Keep LangSmith project selection separate from API credentials.
+def get_langsmith_project_name() -> str:
+    """Read the optional LangSmith project label with a stable local default."""
+    return os.getenv("LANGSMITH_PROJECT", "mediassist-healthcare")
 
 
 # Return the local FastAPI address used by the Streamlit frontend.
